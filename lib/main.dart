@@ -1,6 +1,9 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:saf/saf.dart';
+import 'package:flutter/services.dart' show rootBundle;
+import 'package:file_picker/file_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'verovio_screen.dart';
 
@@ -49,10 +52,8 @@ class FileListScreen extends StatefulWidget {
 }
 
 class _FileListScreenState extends State<FileListScreen> {
-  final Saf _saf = Saf();
-  String? _folderUri;
-  List<SafDocumentFile> _files = [];
-  List<SafDocumentFile> _filteredFiles = [];
+  List<File> _files = [];
+  List<File> _filteredFiles = [];
   List<Playlist> _playlists = [];
   bool _loading = true;
   String _status = 'Ładowanie...';
@@ -69,6 +70,7 @@ class _FileListScreenState extends State<FileListScreen> {
   bool _searchOpen = false;
 
   static const _playedAllKey = 'all';
+  static const _prefsNutyFolder = 'nuty_folder_path';
 
   @override
   void initState() {
@@ -86,52 +88,56 @@ class _FileListScreenState extends State<FileListScreen> {
 
   String get _currentPlayedKey => _activePlaylistId ?? _playedAllKey;
 
-  void _applyFilter() {
-    final query = _searchController.text.toLowerCase().trim();
-    setState(() {
-      var base = _files;
+  Future<Directory> _getNutyDir() async {
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/Nuty');
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    return dir;
+  }
 
-      if (_activePlaylistId != null) {
-        final pl = _playlists.firstWhere(
-          (p) => p.id == _activePlaylistId,
-          orElse: () => Playlist(id: '', name: '', fileNames: []),
-        );
-        base = _files.where((f) => pl.fileNames.contains(f.name)).toList();
-        final order = {
-          for (var i = 0; i < pl.fileNames.length; i++) pl.fileNames[i]: i
-        };
-        base.sort((a, b) =>
-            (order[a.name] ?? 9999).compareTo(order[b.name] ?? 9999));
-      }
+  Future<void> _copyAssetsIfNeeded() async {
+    final prefs = await SharedPreferences.getInstance();
+    final alreadyDone = prefs.getBool('assets_copied') ?? false;
+    if (alreadyDone) return;
 
-      if (query.isEmpty) {
-        _filteredFiles = base;
-      } else {
-        _filteredFiles = base
-            .where((f) => f.name.toLowerCase().contains(query))
-            .toList();
+    const assetFiles = [
+      'assets/nuty/Czardasz.mxl',
+      'assets/nuty/Czarny Orfeusz.mxl',
+    ];
+
+    try {
+      final dir = await _getNutyDir();
+      for (final key in assetFiles) {
+        final fileName = key.split('/').last;
+        final outFile = File('${dir.path}/$fileName');
+        if (await outFile.exists()) continue;
+        try {
+          final data = await rootBundle.load(key);
+          final bytes = data.buffer.asUint8List();
+          await outFile.writeAsBytes(bytes);
+          debugPrint('Skopiowano: $fileName');
+        } catch (e) {
+          debugPrint('Nie udało się skopiować $fileName: $e');
+        }
       }
-    });
+      await prefs.setBool('assets_copied', true);
+    } catch (e) {
+      debugPrint('Błąd kopiowania assets: $e');
+    }
   }
 
   Future<void> _init() async {
     await _loadPlaylists();
     await _loadPlayed();
+    await _copyAssetsIfNeeded();
 
     final prefs = await SharedPreferences.getInstance();
-    _folderUri = prefs.getString('nuty_folder_uri');
-
-    if (_folderUri == null) {
-      await _pickFolder();
-    } else {
-      final grants = await _saf.persistedPermissions();
-      final hasGrant = grants.any((g) => g.uri == _folderUri);
-      if (hasGrant) {
-        await _scanFolder();
-      } else {
-        await _pickFolder();
-      }
-    }
+    final savedPath = prefs.getString(_prefsNutyFolder);
+    final dir = await _getNutyDir();
+    final folder = savedPath != null ? Directory(savedPath) : dir;
+    await _scanFolder(folder);
   }
 
   Future<void> _loadPlaylists() async {
@@ -177,31 +183,46 @@ class _FileListScreenState extends State<FileListScreen> {
   }
 
   Future<void> _pickFolder() async {
-    setState(() => _status = 'Wybierz folder z nutami...');
-    final dir = await _saf.pickDirectory();
-    if (dir == null) {
-      setState(() {
-        _loading = false;
-        _status = 'Nie wybrano folderu. Kliknij, aby wybrać.';
-      });
-      return;
+    final result = await FilePicker.pickFiles(
+      type: FileType.any,
+    );
+
+    if (result.isEmpty) return;
+
+    final dir = await _getNutyDir();
+
+    for (final file in result) {
+      if (file.path == null) continue;
+      try {
+        final bytes = await File(file.path!).readAsBytes();
+        final outFile = File('${dir.path}/${file.name}');
+        await outFile.writeAsBytes(bytes);
+      } catch (e) {
+        debugPrint('Nie udało się skopiować ${file.name}: $e');
+      }
     }
-    _folderUri = dir.uri;
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('nuty_folder_uri', _folderUri!);
-    await _scanFolder();
+
+    await _scanFolder(dir);
   }
 
-  Future<void> _scanFolder() async {
+  Future<void> _scanFolder(Directory dir) async {
     setState(() {
       _loading = true;
       _status = 'Skanowanie...';
     });
 
     try {
-      final files = await _saf.list(_folderUri!);
-      final musicFiles = files.where((f) {
-        final name = f.name.toLowerCase();
+      if (!await dir.exists()) {
+        setState(() {
+          _loading = false;
+          _status = 'Folder nie istnieje';
+        });
+        return;
+      }
+
+      final entries = await dir.list().toList();
+      final musicFiles = entries.whereType<File>().where((f) {
+        final name = f.path.toLowerCase();
         return name.endsWith('.xml') ||
             name.endsWith('.mxl') ||
             name.endsWith('.musicxml') ||
@@ -209,10 +230,12 @@ class _FileListScreenState extends State<FileListScreen> {
       }).toList();
 
       musicFiles.sort((a, b) {
-        final aNum = int.tryParse(a.name.split('_').first) ?? 9999;
-        final bNum = int.tryParse(b.name.split('_').first) ?? 9999;
+        final aName = a.path.split('/').last;
+        final bName = b.path.split('/').last;
+        final aNum = int.tryParse(aName.split('_').first) ?? 9999;
+        final bNum = int.tryParse(bName.split('_').first) ?? 9999;
         if (aNum != bNum) return aNum.compareTo(bNum);
-        return a.name.compareTo(b.name);
+        return aName.compareTo(bName);
       });
 
       setState(() {
@@ -221,6 +244,7 @@ class _FileListScreenState extends State<FileListScreen> {
         _loading = false;
         _status = '${musicFiles.length} plików';
       });
+      _applyFilter();
     } catch (e) {
       setState(() {
         _loading = false;
@@ -229,7 +253,39 @@ class _FileListScreenState extends State<FileListScreen> {
     }
   }
 
-  /// Zapisuje plik jako "zagrany" w kontekście aktualnego widoku.
+  void _applyFilter() {
+    final query = _searchController.text.toLowerCase().trim();
+    setState(() {
+      var base = _files;
+
+      if (_activePlaylistId != null) {
+        final pl = _playlists.firstWhere(
+          (p) => p.id == _activePlaylistId,
+          orElse: () => Playlist(id: '', name: '', fileNames: []),
+        );
+        base = _files
+            .where((f) => pl.fileNames.contains(f.path.split('/').last))
+            .toList();
+        final order = {
+          for (var i = 0; i < pl.fileNames.length; i++) pl.fileNames[i]: i
+        };
+        base.sort((a, b) {
+          final an = a.path.split('/').last;
+          final bn = b.path.split('/').last;
+          return (order[an] ?? 9999).compareTo(order[bn] ?? 9999);
+        });
+      }
+
+      if (query.isEmpty) {
+        _filteredFiles = base;
+      } else {
+        _filteredFiles = base
+            .where((f) => f.path.toLowerCase().contains(query))
+            .toList();
+      }
+    });
+  }
+
   Future<void> _markAsPlayed(String fileName) async {
     final key = _currentPlayedKey;
     final played = _playedByPlaylist[key] ?? [];
@@ -241,36 +297,34 @@ class _FileListScreenState extends State<FileListScreen> {
     }
   }
 
-  Future<void> _openFile(SafDocumentFile file, {int? index}) async {
-    await _markAsPlayed(file.name);
+  Future<void> _openFile(File file, {int? index}) async {
+    final fileName = file.path.split('/').last;
+    await _markAsPlayed(fileName);
 
     if (!mounted) return;
 
-    final navigationList = List<SafDocumentFile>.from(_filteredFiles);
+    final navigationList = List<File>.from(_filteredFiles);
     final currentIndex =
-        index ?? navigationList.indexWhere((f) => f.name == file.name);
+        index ?? navigationList.indexWhere((f) => f.path == file.path);
     final safeIndex = currentIndex < 0 ? 0 : currentIndex;
 
-    // Callback — gdy VerovioScreen zmieni utwór przez swipe/przycisk
-    final onFileChanged = (SafDocumentFile newFile) async {
-      await _markAsPlayed(newFile.name);
-    };
+    Future<void> onFileChanged(String newPath) async {
+      await _markAsPlayed(newPath.split('/').last);
+    }
 
     if (!mounted) return;
     await Navigator.push(
       context,
       MaterialPageRoute(
         builder: (_) => VerovioScreen(
-          file: file,
-          saf: _saf,
-          navigationList: navigationList,
+          filePath: file.path,
+          navigationList: navigationList.map((f) => f.path).toList(),
           currentIndex: safeIndex,
           onFileChanged: onFileChanged,
         ),
       ),
     );
 
-    // Po powrocie odśwież widok — kafelki beżowe
     if (mounted) setState(() {});
   }
 
@@ -296,12 +350,13 @@ class _FileListScreenState extends State<FileListScreen> {
     });
   }
 
-  void _toggleSelection(SafDocumentFile file) {
+  void _toggleSelection(File file) {
+    final name = file.path.split('/').last;
     setState(() {
-      if (_selectedFileNames.contains(file.name)) {
-        _selectedFileNames.remove(file.name);
+      if (_selectedFileNames.contains(name)) {
+        _selectedFileNames.remove(name);
       } else {
-        _selectedFileNames.add(file.name);
+        _selectedFileNames.add(name);
       }
     });
   }
@@ -543,7 +598,6 @@ class _FileListScreenState extends State<FileListScreen> {
                 : Column(
                     children: [
                       _buildTopBar(activePlaylist),
-
                       if (_searchOpen)
                         Padding(
                           padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
@@ -567,7 +621,6 @@ class _FileListScreenState extends State<FileListScreen> {
                             ),
                           ),
                         ),
-
                       Expanded(
                         child: GridView.builder(
                           padding: const EdgeInsets.all(8),
@@ -581,11 +634,12 @@ class _FileListScreenState extends State<FileListScreen> {
                           itemCount: _filteredFiles.length,
                           itemBuilder: (context, index) {
                             final file = _filteredFiles[index];
+                            final fileName = file.path.split('/').last;
                             return _Tile(
-                              file: file,
+                              fileName: fileName,
                               buildMode: _buildMode,
-                              orderNumber: _selectionOrder(file.name),
-                              played: _isPlayed(file.name),
+                              orderNumber: _selectionOrder(fileName),
+                              played: _isPlayed(fileName),
                               onTap: () {
                                 if (_buildMode) {
                                   _toggleSelection(file);
@@ -597,7 +651,6 @@ class _FileListScreenState extends State<FileListScreen> {
                           },
                         ),
                       ),
-
                       if (_buildMode) _buildBuildBar(),
                     ],
                   ),
@@ -614,14 +667,12 @@ class _FileListScreenState extends State<FileListScreen> {
         children: [
           if (_activePlaylistId != null)
             IconButton(
-              icon: const Icon(Icons.arrow_back,
-                  color: Colors.white, size: 22),
+              icon: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
               tooltip: 'Wróć',
               onPressed: _closePlaylist,
             ),
-
           if (_activePlaylistId == null && _playlists.isNotEmpty)
             Expanded(
               child: ListView.builder(
@@ -666,7 +717,6 @@ class _FileListScreenState extends State<FileListScreen> {
                 ),
               ),
             ),
-
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 6),
             child: Text(
@@ -674,7 +724,6 @@ class _FileListScreenState extends State<FileListScreen> {
               style: const TextStyle(color: Colors.white70, fontSize: 12),
             ),
           ),
-
           IconButton(
             icon: Icon(
               _searchOpen ? Icons.search_off : Icons.search,
@@ -686,7 +735,6 @@ class _FileListScreenState extends State<FileListScreen> {
             tooltip: 'Szukaj',
             onPressed: () => setState(() => _searchOpen = !_searchOpen),
           ),
-
           if (!_buildMode && _activePlaylistId == null)
             IconButton(
               icon: const Icon(Icons.add, color: Colors.white, size: 22),
@@ -695,7 +743,6 @@ class _FileListScreenState extends State<FileListScreen> {
               tooltip: 'Nowa playlista',
               onPressed: _startNewPlaylist,
             ),
-
           if (_activePlaylistId != null && !_buildMode)
             IconButton(
               icon: const Icon(Icons.edit, color: Colors.white, size: 22),
@@ -708,7 +755,6 @@ class _FileListScreenState extends State<FileListScreen> {
                 _startEditPlaylist(pl);
               },
             ),
-
           if (_hasPlayedInCurrent && !_buildMode)
             IconButton(
               icon: const Icon(Icons.cleaning_services,
@@ -718,16 +764,13 @@ class _FileListScreenState extends State<FileListScreen> {
               tooltip: 'Czyść listę',
               onPressed: _clearCurrentPlayed,
             ),
-
-          if (_activePlaylistId == null)
-            IconButton(
-              icon: const Icon(Icons.folder_open,
-                  color: Colors.white, size: 22),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-              tooltip: 'Zmień folder',
-              onPressed: _pickFolder,
-            ),
+          IconButton(
+            icon: const Icon(Icons.folder_open, color: Colors.white, size: 22),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+            tooltip: 'Zmień folder',
+            onPressed: _pickFolder,
+          ),
         ],
       ),
     );
@@ -777,14 +820,14 @@ class _FileListScreenState extends State<FileListScreen> {
 }
 
 class _Tile extends StatelessWidget {
-  final SafDocumentFile file;
+  final String fileName;
   final VoidCallback onTap;
   final bool buildMode;
   final int? orderNumber;
   final bool played;
 
   const _Tile({
-    required this.file,
+    required this.fileName,
     required this.onTap,
     this.buildMode = false,
     this.orderNumber,
@@ -793,7 +836,7 @@ class _Tile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final nameWithoutExt = file.name.replaceAll(
+    final nameWithoutExt = fileName.replaceAll(
       RegExp(r'\.(xml|mxl|musicxml|mei)$', caseSensitive: false),
       '',
     );

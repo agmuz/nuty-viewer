@@ -1,22 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:saf/saf.dart';
-import 'package:webview_flutter/webview_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webview_flutter/webview_flutter.dart';
 import 'package:verovio_flutter/verovio_flutter.dart';
 
 class VerovioScreen extends StatefulWidget {
-  final SafDocumentFile file;
-  final Saf saf;
-  final List<SafDocumentFile>? navigationList;
+  final String filePath;
+  final List<String>? navigationList;
   final int currentIndex;
-  final Future<void> Function(SafDocumentFile)? onFileChanged;
+  final Future<void> Function(String)? onFileChanged;
 
   const VerovioScreen({
     super.key,
-    required this.file,
-    required this.saf,
+    required this.filePath,
     this.navigationList,
     this.currentIndex = 0,
     this.onFileChanged,
@@ -34,12 +32,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
   Timer? _hideTimer;
 
   int _zoomValue = 70;
-  int _spacingValue = 2;
+  int _spacingValue = 0;
   String _transposeValue = '';
 
-  late List<SafDocumentFile> _navList;
+  late List<String> _navList;
   late int _currentIndex;
-  late SafDocumentFile _currentFile;
+  late String _currentPath;
 
   static const Map<String, String> _keyLabels = {
     '': 'ORG',
@@ -57,7 +55,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     'b': 'H',
   };
 
-  String get _fileKey => _currentFile.name;
+  String get _fileKey => _currentPath.split('/').last;
 
   String _prefsKey(String setting) => 'viewer-$setting-$_fileKey';
 
@@ -66,9 +64,9 @@ class _VerovioScreenState extends State<VerovioScreen> {
   @override
   void initState() {
     super.initState();
-    _currentFile = widget.file;
+    _currentPath = widget.filePath;
     _currentIndex = widget.currentIndex;
-    _navList = widget.navigationList ?? [widget.file];
+    _navList = widget.navigationList ?? [widget.filePath];
     _loadPrefsForCurrentFile().then((_) => _init());
     _scheduleHide();
   }
@@ -83,7 +81,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     final prefs = await SharedPreferences.getInstance();
     _zoomValue = ((prefs.getInt(_prefsKey('zoom')) ?? 70) / 5).round() * 5;
     _zoomValue = _zoomValue.clamp(40, 140);
-    _spacingValue = (prefs.getInt(_prefsKey('spacing')) ?? 2).clamp(-8, 20);
+    _spacingValue = (prefs.getInt(_prefsKey('spacing')) ?? 0).clamp(0, 20);
     _transposeValue = prefs.getString(_prefsKey('transpose')) ?? '';
   }
 
@@ -95,7 +93,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
   }
 
   int _clampZoom(int v) => ((v / 5).round() * 5).clamp(40, 140);
-  int _clampSpacing(int v) => v.clamp(-8, 20);
+  int _clampSpacing(int v) => v.clamp(0, 20);
 
   void _scheduleHide() {
     _hideTimer?.cancel();
@@ -120,14 +118,13 @@ class _VerovioScreenState extends State<VerovioScreen> {
       final controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
         ..setBackgroundColor(Colors.white)
-        ..enableZoom(false);
+        ..enableZoom(true);
 
       if (!mounted) return;
       setState(() {
         _service = service;
         _webController = controller;
       });
-      debugPrint('Verovio gotowe');
 
       await _renderCurrentFile();
     } catch (e) {
@@ -142,7 +139,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
   }
 
   Future<void> _renderCurrentFile() async {
-    debugPrint('Renderowanie: ${_currentFile.name}');
     _toggleBar();
 
     try {
@@ -156,13 +152,15 @@ class _VerovioScreenState extends State<VerovioScreen> {
         'footer': 'none',
         'header': 'none',
         'mnumInterval': 0,
+        'mnumHome': false,
+        'mnumAll': false,
         'spacingSystem': _spacingValue > 0 ? _spacingValue : 2,
         'transpose': _transposeValue,
       };
       await _service!.setOptionsJson(jsonEncode(options));
 
-      final bytes = await widget.saf.readFileBytes(_currentFile.uri);
-      final isMxl = _currentFile.name.toLowerCase().endsWith('.mxl');
+      final bytes = await File(_currentPath).readAsBytes();
+      final isMxl = _currentPath.toLowerCase().endsWith('.mxl');
 
       if (isMxl) {
         await _service!.loadZipDataBuffer(bytes);
@@ -180,9 +178,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
       await _webController!.loadHtmlString(_svgHtmlWithSpacing(svg));
       if (!mounted) return;
-      final trLabel = _keyLabels[_transposeValue] ?? 'ORG';
-      debugPrint(
-          'Z $_zoomValue%  W ${_spacingValue > 0 ? "+$_spacingValue" : "$_spacingValue"}  T $trLabel');
       _toggleBar();
     } catch (e) {
       debugPrint('Błąd: $e');
@@ -192,91 +187,113 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   Future<void> _navigate(int direction) async {
     final newIndex = _currentIndex + direction;
-    if (newIndex < 0 || newIndex >= _navList.length) {
-      return;
-    }
+    if (newIndex < 0 || newIndex >= _navList.length) return;
 
     await _savePrefsForCurrentFile();
 
     setState(() {
       _currentIndex = newIndex;
-      _currentFile = _navList[newIndex];
+      _currentPath = _navList[newIndex];
     });
 
-    // Poinformuj FileListScreen — oznacz jako zagrany
-    await widget.onFileChanged?.call(_currentFile);
+    await widget.onFileChanged?.call(_currentPath);
 
     await _loadPrefsForCurrentFile();
-
     await _renderCurrentFile();
   }
 
   String _svgHtmlWithSpacing(String svg) {
-    return '''
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <style>
-    html, body { margin: 0; padding: 12px; background: #fff; }
-    svg { display: block; max-width: 100%; height: auto; }
-  </style>
-</head>
-<body>
-$svg
-<script>
-(function() {
-  var spacingValue = $_spacingValue;
-  function compactSystems() {
-    var svg = document.querySelector('svg');
-    if (!svg) return;
-    var systems = svg.querySelectorAll('g.system, g[class~="system"]');
-    if (systems.length < 2) return;
-    var vb = svg.viewBox && svg.viewBox.baseVal;
-    if (!vb || !vb.width) return;
-    var renderedWidth = svg.getBoundingClientRect().width;
-    if (!renderedWidth) return;
-    var unitsPerPx = vb.width / renderedWidth;
-    if (spacingValue < 0) {
-      var strength = Math.min(0.78, Math.abs(spacingValue) * 0.085);
-      var tops = [];
-      systems.forEach(function(g) { tops.push(g.getBoundingClientRect().top); });
-      var firstTop = tops[0];
-      var largestShift = 0;
-      systems.forEach(function(g, index) {
-        if (index === 0) return;
-        var shift = (tops[index] - firstTop) * strength * unitsPerPx;
-        largestShift = Math.max(largestShift, shift);
-        var original = g.getAttribute('transform') || '';
-        g.setAttribute('transform', 'translate(0 ' + (-shift) + ') ' + original);
-      });
-      var newHeight = Math.max(vb.height * 0.35, vb.height - largestShift);
-      svg.setAttribute('viewBox', vb.x + ' ' + vb.y + ' ' + vb.width + ' ' + newHeight);
-      svg.removeAttribute('height');
-    } else if (spacingValue > 2) {
-      var extra = (spacingValue - 2) * 0.085;
-      systems.forEach(function(g, index) {
-        if (index === 0) return;
-        var prev = systems[index - 1];
-        var prevRect = prev.getBoundingClientRect();
-        var curRect = g.getBoundingClientRect();
-        var currentGap = curRect.top - prevRect.bottom;
-        var extraShift = currentGap * extra * unitsPerPx;
-        var original = g.getAttribute('transform') || '';
-        g.setAttribute('transform', 'translate(0 ' + extraShift + ') ' + original);
-      });
-      var newHeight = vb.height * (1 + extra * systems.length * 0.1);
-      svg.setAttribute('viewBox', vb.x + ' ' + vb.y + ' ' + vb.width + ' ' + newHeight);
-      svg.removeAttribute('height');
-    }
-  }
-  setTimeout(compactSystems, 50);
-})();
-</script>
-</body>
-</html>
-''';
+    final sb = StringBuffer();
+    sb.writeln('<!DOCTYPE html>');
+    sb.writeln('<html>');
+    sb.writeln('<head>');
+    sb.writeln('  <meta charset="utf-8">');
+    sb.writeln(
+        '  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">');
+    sb.writeln('  <style>');
+    sb.writeln('    html, body {');
+    sb.writeln('      margin: 0;');
+    sb.writeln('      padding: 12px;');
+    sb.writeln('      background: #fff;');
+    sb.writeln('      -webkit-overflow-scrolling: touch;');
+    sb.writeln('    }');
+    sb.writeln('    svg { display: block; max-width: 100%; height: auto; }');
+    sb.writeln(
+        '    svg .mNum, svg [class~="mNum"], svg g.mNum, svg text.mNum {');
+    sb.writeln('      display: none !important;');
+    sb.writeln('    }');
+    sb.writeln('  </style>');
+    sb.writeln('</head>');
+    sb.writeln('<body>');
+    sb.writeln(svg);
+    sb.writeln('<script>');
+    sb.writeln('(function() {');
+    sb.writeln('  var spacingValue = $_spacingValue;');
+    sb.writeln('  function compactSystems() {');
+    sb.writeln('    var svg = document.querySelector("svg");');
+    sb.writeln('    if (!svg) return;');
+    sb.writeln(
+        '    svg.querySelectorAll("text.mNum, g.mNum, [class~=\\"mNum\\"]").forEach(function(el) {');
+    sb.writeln('      el.remove();');
+    sb.writeln('    });');
+    sb.writeln(
+        '    var systems = svg.querySelectorAll("g.system, g[class~=\\"system\\"]");');
+    sb.writeln('    if (systems.length < 2) return;');
+    sb.writeln('    var vb = svg.viewBox && svg.viewBox.baseVal;');
+    sb.writeln('    if (!vb || !vb.width) return;');
+    sb.writeln('    var renderedWidth = svg.getBoundingClientRect().width;');
+    sb.writeln('    if (!renderedWidth) return;');
+    sb.writeln('    var unitsPerPx = vb.width / renderedWidth;');
+    sb.writeln('    if (spacingValue === 0) {');
+    sb.writeln(
+        '      var strength = Math.min(0.78, 0.5 * 0.085);');
+    sb.writeln('      var tops = [];');
+    sb.writeln(
+        '      systems.forEach(function(g) { tops.push(g.getBoundingClientRect().top); });');
+    sb.writeln('      var firstTop = tops[0];');
+    sb.writeln('      var largestShift = 0;');
+    sb.writeln('      systems.forEach(function(g, index) {');
+    sb.writeln('        if (index === 0) return;');
+    sb.writeln(
+        '        var shift = (tops[index] - firstTop) * strength * unitsPerPx;');
+    sb.writeln('        largestShift = Math.max(largestShift, shift);');
+    sb.writeln(
+        '        var original = g.getAttribute("transform") || "";');
+    sb.writeln(
+        '        g.setAttribute("transform", "translate(0 " + (-shift) + ") " + original);');
+    sb.writeln('      });');
+    sb.writeln(
+        '      var newHeight = Math.max(vb.height * 0.5, vb.height - largestShift);');
+    sb.writeln(
+        '      svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + vb.width + " " + newHeight);');
+    sb.writeln('      svg.removeAttribute("height");');
+    sb.writeln('    } else if (spacingValue > 2) {');
+    sb.writeln('      var extra = (spacingValue - 2) * 0.085;');
+    sb.writeln('      systems.forEach(function(g, index) {');
+    sb.writeln('        if (index === 0) return;');
+    sb.writeln('        var prev = systems[index - 1];');
+    sb.writeln('        var prevRect = prev.getBoundingClientRect();');
+    sb.writeln('        var curRect = g.getBoundingClientRect();');
+    sb.writeln('        var currentGap = curRect.top - prevRect.bottom;');
+    sb.writeln('        var extraShift = currentGap * extra * unitsPerPx;');
+    sb.writeln(
+        '        var original = g.getAttribute("transform") || "";');
+    sb.writeln(
+        '        g.setAttribute("transform", "translate(0 " + extraShift + ") " + original);');
+    sb.writeln('      });');
+    sb.writeln(
+        '      var newHeight = vb.height * (1 + extra * systems.length * 0.1);');
+    sb.writeln(
+        '      svg.setAttribute("viewBox", vb.x + " " + vb.y + " " + vb.width + " " + newHeight);');
+    sb.writeln('      svg.removeAttribute("height");');
+    sb.writeln('    }');
+    sb.writeln('  }');
+    sb.writeln('  setTimeout(compactSystems, 50);');
+    sb.writeln('})();');
+    sb.writeln('</script>');
+    sb.writeln('</body>');
+    sb.writeln('</html>');
+    return sb.toString();
   }
 
   Future<void> _changeZoom(int step) async {
@@ -315,22 +332,12 @@ $svg
                 ? const Center(child: CircularProgressIndicator())
                 : WebViewWidget(controller: _webController!),
           ),
-
           Positioned.fill(
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
               onTap: _toggleBar,
-              onHorizontalDragEnd: (details) {
-                final velocity = details.primaryVelocity ?? 0;
-                if (velocity < -300) {
-                  _navigate(1);
-                } else if (velocity > 300) {
-                  _navigate(-1);
-                }
-              },
             ),
           ),
-
           AnimatedPositioned(
             duration: const Duration(milliseconds: 250),
             curve: Curves.easeOut,
@@ -423,7 +430,6 @@ $svg
               ),
             ),
           ),
-
           if (_hasNavigation)
             AnimatedPositioned(
               duration: const Duration(milliseconds: 250),
@@ -457,7 +463,7 @@ $svg
                       ),
                       Expanded(
                         child: Text(
-                          _currentFile.name.replaceAll(
+                          _fileKey.replaceAll(
                             RegExp(r'\.(xml|mxl|musicxml|mei)$',
                                 caseSensitive: false),
                             '',
