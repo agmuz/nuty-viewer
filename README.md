@@ -1,6 +1,6 @@
-# Nuty — przeglądarka nut dla trąbaczy
+# Nuty — przeglądarka nut dla trębaczy
 
-Aplikacja Android do wyświetlania nut z plików MusicXML/MXL z **transpozycją** — dla trąbaczy, saksofonistów, klarnecistów i innych instrumentalistów transponujących.
+Aplikacja Android do wyświetlania nut z plików MusicXML/MXL z **transpozycją** — dla trębaczy, saksofonistów, klarnecistów i innych instrumentalistów transponujących.
 
 ## Funkcje
 
