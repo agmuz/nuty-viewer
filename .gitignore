@@ -53,3 +53,7 @@ android/local.properties
 android/key.properties
 *.jks
 *.keystore
+
+# SoundFont - za duże na GitHub (148 MB)
+assets/soundfonts/*.sf2
+assets/soundfonts/*.sf3

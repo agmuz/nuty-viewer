@@ -1,20 +1,26 @@
 PODS:
   - Flutter (1.0.0)
+  - rush_synth (0.0.1):
+    - Flutter
   - verovio_flutter (0.3.3):
     - Flutter
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
+  - rush_synth (from `.symlinks/plugins/rush_synth/ios`)
   - verovio_flutter (from `.symlinks/plugins/verovio_flutter/ios`)
 
 EXTERNAL SOURCES:
   Flutter:
     :path: Flutter
+  rush_synth:
+    :path: ".symlinks/plugins/rush_synth/ios"
   verovio_flutter:
     :path: ".symlinks/plugins/verovio_flutter/ios"
 
 SPEC CHECKSUMS:
   Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
+  rush_synth: caeefac67f59eb910a98b8f444cfd36b492c6b05
   verovio_flutter: 41035688b7ba3c10638bae79c316194d6c9fbd1b
 
 PODFILE CHECKSUM: 3ba3a73b1b12adcf321a227a745625fe0888cc82

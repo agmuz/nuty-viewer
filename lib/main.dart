@@ -6,9 +6,11 @@ import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'verovio_screen.dart';
+import 'package:rush_synth/rush_synth.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await RushSynthLib.init();
   runApp(const MyApp());
 }
 
@@ -51,7 +53,8 @@ class FileListScreen extends StatefulWidget {
   State<FileListScreen> createState() => _FileListScreenState();
 }
 
-class _FileListScreenState extends State<FileListScreen> {
+class _FileListScreenState extends State<FileListScreen>
+    with WidgetsBindingObserver {
   List<File> _files = [];
   List<File> _filteredFiles = [];
   List<Playlist> _playlists = [];
@@ -75,15 +78,24 @@ class _FileListScreenState extends State<FileListScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _init();
     _searchController.addListener(_applyFilter);
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _searchController.dispose();
     _playlistNameController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _getNutyDir().then((dir) => _scanFolder(dir));
+    }
   }
 
   String get _currentPlayedKey => _activePlaylistId ?? _playedAllKey;
@@ -433,45 +445,49 @@ class _FileListScreenState extends State<FileListScreen> {
   Future<void> _showPlaylistMenu(Playlist pl) async {
     final action = await showModalBottomSheet<String>(
       context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
       builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.all(16),
-              child: Text(
-                pl.name,
-                style: const TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text(
+                  pl.name,
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
               ),
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.play_arrow),
-              title: const Text('Otwórz playlistę'),
-              onTap: () => Navigator.pop(ctx, 'open'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.edit),
-              title: const Text('Edytuj playlistę'),
-              onTap: () => Navigator.pop(ctx, 'edit'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.cleaning_services),
-              title: const Text('Wyczyść oznaczenia'),
-              onTap: () => Navigator.pop(ctx, 'clear'),
-            ),
-            ListTile(
-              leading: const Icon(Icons.delete, color: Colors.red),
-              title: const Text(
-                'Usuń playlistę',
-                style: TextStyle(color: Colors.red),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(Icons.play_arrow),
+                title: const Text('Otwórz playlistę'),
+                onTap: () => Navigator.pop(ctx, 'open'),
               ),
-              onTap: () => Navigator.pop(ctx, 'delete'),
-            ),
-          ],
+              ListTile(
+                leading: const Icon(Icons.edit),
+                title: const Text('Edytuj playlistę'),
+                onTap: () => Navigator.pop(ctx, 'edit'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.cleaning_services),
+                title: const Text('Wyczyść oznaczenia'),
+                onTap: () => Navigator.pop(ctx, 'clear'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.delete, color: Colors.red),
+                title: const Text(
+                  'Usuń playlistę',
+                  style: TextStyle(color: Colors.red),
+                ),
+                onTap: () => Navigator.pop(ctx, 'delete'),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -622,30 +638,37 @@ class _FileListScreenState extends State<FileListScreen> {
                           ),
                         ),
                       Expanded(
-                        child: GridView.builder(
-                          padding: const EdgeInsets.all(8),
-                          gridDelegate:
-                              const SliverGridDelegateWithFixedCrossAxisCount(
-                            crossAxisCount: 4,
-                            crossAxisSpacing: 8,
-                            mainAxisSpacing: 8,
-                            childAspectRatio: 4.0,
-                          ),
-                          itemCount: _filteredFiles.length,
-                          itemBuilder: (context, index) {
-                            final file = _filteredFiles[index];
-                            final fileName = file.path.split('/').last;
-                            return _Tile(
-                              fileName: fileName,
-                              buildMode: _buildMode,
-                              orderNumber: _selectionOrder(fileName),
-                              played: _isPlayed(fileName),
-                              onTap: () {
-                                if (_buildMode) {
-                                  _toggleSelection(file);
-                                } else {
-                                  _openFile(file, index: index);
-                                }
+                        child: LayoutBuilder(
+                          builder: (context, constraints) {
+                            final isLandscape =
+                                constraints.maxWidth > constraints.maxHeight;
+                            final cols = isLandscape ? 4 : 2;
+                            return GridView.builder(
+                              padding: const EdgeInsets.all(8),
+                              gridDelegate:
+                                  SliverGridDelegateWithFixedCrossAxisCount(
+                                crossAxisCount: cols,
+                                crossAxisSpacing: 8,
+                                mainAxisSpacing: 8,
+                                childAspectRatio: 4.0,
+                              ),
+                              itemCount: _filteredFiles.length,
+                              itemBuilder: (context, index) {
+                                final file = _filteredFiles[index];
+                                final fileName = file.path.split('/').last;
+                                return _Tile(
+                                  fileName: fileName,
+                                  buildMode: _buildMode,
+                                  orderNumber: _selectionOrder(fileName),
+                                  played: _isPlayed(fileName),
+                                  onTap: () {
+                                    if (_buildMode) {
+                                      _toggleSelection(file);
+                                    } else {
+                                      _openFile(file, index: index);
+                                    }
+                                  },
+                                );
                               },
                             );
                           },
@@ -850,6 +873,10 @@ class _Tile extends StatelessWidget {
       title = parts.sublist(1).join(' ').replaceAll('_', ' ');
     }
 
+    if (title.length > 16) {
+      title = '${title.substring(0, 15)}…';
+    }
+
     final selected = orderNumber != null;
 
     Color bgColor;
@@ -868,13 +895,13 @@ class _Tile extends StatelessWidget {
         onTap: onTap,
         borderRadius: BorderRadius.circular(6),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           child: Row(
             children: [
               if (buildMode && selected)
                 Container(
-                  width: 36,
-                  height: 36,
+                  width: 28,
+                  height: 28,
                   alignment: Alignment.center,
                   decoration: const BoxDecoration(
                     color: Colors.black87,
@@ -883,7 +910,7 @@ class _Tile extends StatelessWidget {
                   child: Text(
                     '$orderNumber',
                     style: const TextStyle(
-                      fontSize: 16,
+                      fontSize: 12,
                       fontWeight: FontWeight.bold,
                       color: Colors.white,
                     ),
@@ -891,8 +918,8 @@ class _Tile extends StatelessWidget {
                 )
               else if (number.isNotEmpty)
                 Container(
-                  width: 36,
-                  height: 36,
+                  width: 28,
+                  height: 28,
                   alignment: Alignment.center,
                   decoration: const BoxDecoration(
                     color: Colors.white,
@@ -901,26 +928,23 @@ class _Tile extends StatelessWidget {
                   child: Text(
                     number,
                     style: const TextStyle(
-                      fontSize: 16,
+                      fontSize: 12,
                       fontWeight: FontWeight.bold,
                       color: Colors.black,
                     ),
                   ),
                 ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 6),
               Expanded(
-                child: FittedBox(
-                  fit: BoxFit.scaleDown,
-                  alignment: Alignment.centerLeft,
-                  child: Text(
-                    title,
-                    style: const TextStyle(
-                      fontSize: 20,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.black,
-                    ),
-                    maxLines: 1,
+                child: Text(
+                  title,
+                  style: const TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: Colors.black,
                   ),
+                  maxLines: 1,
+                  overflow: TextOverflow.clip,
                 ),
               ),
             ],
