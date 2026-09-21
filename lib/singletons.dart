@@ -37,15 +37,18 @@ class VerovioSingleton {
 
 /// Singleton dla RushSequencer (syntezator audio).
 ///
-/// UWAGA: rush_synth.stop() blokuje wątek natywny i po kilku wywołaniach
-/// iOS zabija apkę (AURemoteIO::Stop error). Dlatego:
-///  - NIE wołamy stop() w ogóle.
-///  - Zamiast trzymać jedną instancję — przy każdym play() tworzymy nową.
-///  - Stara instancja jest porzucana (GC się nią zajmie).
+/// rush_synth.stop() blokuje wątek natywny iOS — dlatego go NIE wołamy.
+/// Zamiast tego:
+///  - Każdy play() tworzy nową instancję (bo stop() blokuje).
+///  - Wszystkie instancje zapisujemy na liście `_allInstances`.
+///  - Panic() wycisza WSZYSTKIE instancje przez setSpeed(0).
 class AudioSingleton {
   static RushSequencer? _instance;
   static bool _initializing = false;
   static bool _isPlaying = false;
+
+  /// Wszystkie utworzone instancje — żeby móc je wyciszyć w Panic.
+  static final List<RushSequencer> _allInstances = [];
 
   static bool get isPlaying => _isPlaying;
 
@@ -59,9 +62,11 @@ class AudioSingleton {
     }
     _initializing = true;
     try {
-      _instance = await RushSequencer.fromAsset(
+      final seq = await RushSequencer.fromAsset(
         'assets/soundfonts/FluidR3_GM.sf2',
       );
+      _instance = seq;
+      _allInstances.add(seq);
     } finally {
       _initializing = false;
     }
@@ -71,21 +76,29 @@ class AudioSingleton {
   static RushSequencer? get instanceOrNull => _instance;
 
   /// Utwórz NOWĄ instancję — używaj przy każdym play().
-  /// Stara instancja zostanie porzucona (GC).
-  /// To jedyny sposób, żeby uniknąć stop() (który blokuje iOS).
+  /// Stara zostaje na liście `_allInstances` — będzie wyciszona w Panic.
   static Future<RushSequencer> recreate() async {
     _isPlaying = false;
-    _instance = null;
-    _instance = await RushSequencer.fromAsset(
+    final seq = await RushSequencer.fromAsset(
       'assets/soundfonts/FluidR3_GM.sf2',
     );
-    return _instance!;
+    _instance = seq;
+    _allInstances.add(seq);
+    return seq;
   }
 
-  /// Zwolnij instancję przy zamykaniu ekranu.
-  /// NIE woła stop() — tylko ustawia null, żeby GC posprzątał.
-  static void release() {
+  /// PANIC — wycisz wszystkie silniki (setSpeed(0)).
+  /// To nie zatrzymuje wątków natywnych, ale wycisza dźwięk.
+  static Future<void> panic() async {
     _isPlaying = false;
+    final snapshot = List<RushSequencer>.from(_allInstances);
+    for (final seq in snapshot) {
+      try {
+        await seq.setSpeed(0.0);
+      } catch (_) {}
+    }
+    // Wyczyść listę — stare silniki nie są już potrzebne
+    _allInstances.clear();
     _instance = null;
   }
 
@@ -98,7 +111,6 @@ class AudioSingleton {
   }
 
   static Future<void> dispose() async {
-    _isPlaying = false;
-    _instance = null;
+    await panic();
   }
 }

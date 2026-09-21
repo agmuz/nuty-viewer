@@ -107,9 +107,8 @@ class _VerovioScreenState extends State<VerovioScreen> {
     _highlightTimer?.cancel();
     _playbackMonitor = null;
     _highlightTimer = null;
-    // NIE wołaj stop() — blokuje wątek natywny iOS.
-    // Zwolnij instancję — następny ekran utworzy nową.
-    AudioSingleton.release();
+    // Fire and forget — wycisz wszystkie silniki
+    AudioSingleton.panic();
     super.dispose();
   }
 
@@ -245,7 +244,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     final newIndex = _currentIndex + direction;
     if (newIndex < 0 || newIndex >= _navList.length) return;
 
-    _stopPlaybackSync();
+    await _panic();
     await _savePrefsForCurrentFile();
 
     setState(() {
@@ -415,7 +414,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   Future<void> _changeInstrument(int program) async {
     if (program == _selectedInstrument) return;
-    _stopPlaybackSync();
+    await _panic();
     setState(() => _selectedInstrument = program);
     await _savePrefsForCurrentFile();
     _toggleBar();
@@ -477,18 +476,18 @@ class _VerovioScreenState extends State<VerovioScreen> {
     return idx >= 0 ? id.substring(0, idx) : id;
   }
 
-  /// Synchronous stop — bez czekania na stop() (bo blokuje iOS).
-  void _stopPlaybackSync() {
+  /// PANIC — wycisz wszystkie silniki audio i zatrzymaj timery.
+  /// To jest jedyny sposób, żeby uciszyć stare instancje (bo stop() blokuje iOS).
+  Future<void> _panic() async {
     _playbackMonitor?.cancel();
     _playbackMonitor = null;
     _highlightTimer?.cancel();
     _highlightTimer = null;
-    AudioSingleton.markStopped();
-    if (mounted) {
-      setState(() => _isPlaying = false);
-    }
+    await AudioSingleton.panic();
+    if (!mounted) return;
+    setState(() => _isPlaying = false);
     try {
-      _webController?.runJavaScript(
+      await _webController?.runJavaScript(
           'window.__clearHighlights && window.__clearHighlights();');
     } catch (_) {}
   }
@@ -499,13 +498,16 @@ class _VerovioScreenState extends State<VerovioScreen> {
       return;
     }
 
-    // Jeśli gra — zatrzymaj
+    // Jeśli gra — PANIC
     if (_isPlaying) {
-      _stopPlaybackSync();
+      await _panic();
       return;
     }
 
     try {
+      // PANIC przed startem nowego — wycisz wszystkie stare
+      await AudioSingleton.panic();
+
       final midiBytes = await _service!.renderToMidiBytes();
       if (midiBytes.isEmpty) {
         debugPrint('Verovio nie zwróciło MIDI');
@@ -520,13 +522,13 @@ class _VerovioScreenState extends State<VerovioScreen> {
       );
       await midiFile.writeAsBytes(modified);
 
+      // Utwórz NOWĄ instancję sequencera
+      _sequencer = await AudioSingleton.recreate();
+
       if (!mounted) return;
       setState(() => _isPlaying = true);
       AudioSingleton.markPlaying();
       _toggleBar();
-
-      // Utwórz NOWĄ instancję sequencera — bez stop() (bo blokuje iOS)
-      _sequencer = await AudioSingleton.recreate();
 
       await _sequencer!.setSpeed(_tempoBpm / 120.0);
       debugPrint('Wywołuję play() z pliku: ${midiFile.path}');
@@ -596,7 +598,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
       );
     } catch (e) {
       debugPrint('Błąd odtwarzania: $e');
-      _stopPlaybackSync();
+      await _panic();
     }
   }
 
@@ -633,9 +635,10 @@ class _VerovioScreenState extends State<VerovioScreen> {
                   children: [
                     _iconBtn(
                       icon: Icons.arrow_back,
-                      onPressed: () {
-                        _stopPlaybackSync();
+                      onPressed: () async {
+                        await _panic();
                         _hideTimer?.cancel();
+                        if (!mounted) return;
                         Navigator.pop(context);
                       },
                       tooltip: 'Wróć',
@@ -731,13 +734,15 @@ class _VerovioScreenState extends State<VerovioScreen> {
                       ),
                     ),
                     const SizedBox(width: 2),
+                    // ── PANIC (STOP) ─────────────────────────────
                     _iconBtn(
                       icon: Icons.stop,
                       onPressed:
-                          (_audioReady && _isPlaying) ? _stopPlaybackSync : null,
-                      tooltip: 'Stop',
+                          (_audioReady && _isPlaying) ? _panic : null,
+                      tooltip: 'Stop (Panic)',
                       enabled: _audioReady && _isPlaying,
                     ),
+                    // ── PLAY / PAUZA ────────────────────────────
                     _iconBtn(
                       icon: _isPlaying ? Icons.pause : Icons.play_arrow,
                       onPressed: _audioReady ? _togglePlayback : null,
