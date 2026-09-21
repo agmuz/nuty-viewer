@@ -20,8 +20,8 @@ EXTERNAL SOURCES:
 
 SPEC CHECKSUMS:
   Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
-  rush_synth: caeefac67f59eb910a98b8f444cfd36b492c6b05
-  verovio_flutter: 41035688b7ba3c10638bae79c316194d6c9fbd1b
+  rush_synth: 665686d06f08ec9991cf28e375a73d5937869fdf
+  verovio_flutter: ac6bb6c344240943ffc0d73db080d316290aabc2
 
 PODFILE CHECKSUM: 3ba3a73b1b12adcf321a227a745625fe0888cc82
 

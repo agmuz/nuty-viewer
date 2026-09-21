@@ -9,6 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:verovio_flutter/verovio_flutter.dart';
 
+import 'singletons.dart';
+
 class VerovioScreen extends StatefulWidget {
   final String filePath;
   final List<String>? navigationList;
@@ -43,6 +45,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
   bool _audioReady = false;
   bool _isPlaying = false;
   Timer? _playbackMonitor;
+  Timer? _highlightTimer;
 
   int _selectedInstrument = 11;
   int _tempoBpm = 120;
@@ -101,7 +104,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
   void dispose() {
     _hideTimer?.cancel();
     _playbackMonitor?.cancel();
-    _sequencer?.stop();
+    _highlightTimer?.cancel();
+    _playbackMonitor = null;
+    _highlightTimer = null;
+    // NIE wołaj stop() — blokuje wątek natywny iOS.
+    // Zwolnij instancję — następny ekran utworzy nową.
+    AudioSingleton.release();
     super.dispose();
   }
 
@@ -148,10 +156,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   Future<void> _init() async {
     try {
-      final resourcePath =
-          await VerovioResourceManager.ensureVerovioAssetsReady();
-      final service =
-          await VerovioAsyncService.spawn(resourcePath: resourcePath);
+      final service = await VerovioSingleton.get();
 
       final controller = WebViewController()
         ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -173,15 +178,13 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   Future<void> _initAudio() async {
     try {
-      final seq = await RushSequencer.fromAsset(
-        'assets/soundfonts/FluidR3_GM.sf2',
-      );
+      final seq = await AudioSingleton.get();
       if (!mounted) return;
       setState(() {
         _sequencer = seq;
         _audioReady = true;
       });
-      debugPrint('Audio gotowe (rush_synth + FluidR3_GM.sf2)');
+      debugPrint('Audio gotowe (singleton)');
     } catch (e) {
       debugPrint('Błąd audio: $e');
     }
@@ -207,8 +210,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
         'footer': 'none',
         'header': 'none',
         'mnumInterval': 0,
-        'mnumHome': false,
-        'mnumAll': false,
         'spacingSystem': _spacingValue > 0 ? _spacingValue : 2,
         'transpose': _transposeValue,
       };
@@ -244,7 +245,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     final newIndex = _currentIndex + direction;
     if (newIndex < 0 || newIndex >= _navList.length) return;
 
-    await _stopPlayback();
+    _stopPlaybackSync();
     await _savePrefsForCurrentFile();
 
     setState(() {
@@ -290,6 +291,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     sb.writeln('(function() {');
     sb.writeln('  var spacingValue = $_spacingValue;');
     sb.writeln('  var viewMode = "$_viewMode";');
+    sb.writeln('  var previousHighlighted = [];');
     sb.writeln('  function applySettings() {');
     sb.writeln('    var svg = document.querySelector("svg");');
     sb.writeln('    if (!svg) return;');
@@ -301,7 +303,8 @@ class _VerovioScreenState extends State<VerovioScreen> {
     sb.writeln('    if (viewMode === "notes") {');
     sb.writeln('      document.body.classList.add("notes-only-active");');
     sb.writeln('    }');
-    sb.writeln('    var systems = svg.querySelectorAll("g.system, g[class~=\\"system\\"]");');
+    sb.writeln(
+        '    var systems = svg.querySelectorAll("g.system, g[class~=\\"system\\"]");');
     sb.writeln('    if (systems.length < 2) return;');
     sb.writeln('    var vb = svg.viewBox && svg.viewBox.baseVal;');
     sb.writeln('    if (!vb || !vb.width) return;');
@@ -317,8 +320,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     sb.writeln('        var curRect = g.getBoundingClientRect();');
     sb.writeln('        var currentGap = curRect.top - prevRect.bottom;');
     sb.writeln('        var extraShift = currentGap * extra * unitsPerPx;');
-    sb.writeln(
-        '        var original = g.getAttribute("transform") || "";');
+    sb.writeln('        var original = g.getAttribute("transform") || "";');
     sb.writeln(
         '        g.setAttribute("transform", "translate(0 " + extraShift + ") " + original);');
     sb.writeln('      });');
@@ -330,6 +332,53 @@ class _VerovioScreenState extends State<VerovioScreen> {
     sb.writeln('    }');
     sb.writeln('  }');
     sb.writeln('  window.__applySettings = applySettings;');
+    sb.writeln('  function restoreElement(el) {');
+    sb.writeln('    el.removeAttribute("fill");');
+    sb.writeln('    el.removeAttribute("stroke");');
+    sb.writeln('    el.style.fill = "";');
+    sb.writeln('    el.style.stroke = "";');
+    sb.writeln('    var descendants = el.querySelectorAll("*");');
+    sb.writeln('    descendants.forEach(function(d) {');
+    sb.writeln('      d.removeAttribute("fill");');
+    sb.writeln('      d.removeAttribute("stroke");');
+    sb.writeln('      d.style.fill = "";');
+    sb.writeln('      d.style.stroke = "";');
+    sb.writeln('    });');
+    sb.writeln('  }');
+    sb.writeln('  function paintElement(el) {');
+    sb.writeln('    el.setAttribute("fill", "red");');
+    sb.writeln('    el.setAttribute("stroke", "red");');
+    sb.writeln('    el.style.fill = "red";');
+    sb.writeln('    el.style.stroke = "red";');
+    sb.writeln('    var descendants = el.querySelectorAll("*");');
+    sb.writeln('    descendants.forEach(function(d) {');
+    sb.writeln('      d.setAttribute("fill", "red");');
+    sb.writeln('      d.setAttribute("stroke", "red");');
+    sb.writeln('      d.style.fill = "red";');
+    sb.writeln('      d.style.stroke = "red";');
+    sb.writeln('    });');
+    sb.writeln('  }');
+    sb.writeln('  window.__highlightNotes = function(ids) {');
+    sb.writeln('    previousHighlighted.forEach(function(id) {');
+    sb.writeln('      var el = document.getElementById(id);');
+    sb.writeln('      if (el) restoreElement(el);');
+    sb.writeln('    });');
+    sb.writeln('    previousHighlighted = [];');
+    sb.writeln('    ids.forEach(function(id) {');
+    sb.writeln('      var el = document.getElementById(id);');
+    sb.writeln('      if (el) {');
+    sb.writeln('        paintElement(el);');
+    sb.writeln('        previousHighlighted.push(id);');
+    sb.writeln('      }');
+    sb.writeln('    });');
+    sb.writeln('  };');
+    sb.writeln('  window.__clearHighlights = function() {');
+    sb.writeln('    previousHighlighted.forEach(function(id) {');
+    sb.writeln('      var el = document.getElementById(id);');
+    sb.writeln('      if (el) restoreElement(el);');
+    sb.writeln('    });');
+    sb.writeln('    previousHighlighted = [];');
+    sb.writeln('  };');
     sb.writeln('  setTimeout(applySettings, 50);');
     sb.writeln('})();');
     sb.writeln('</script>');
@@ -366,12 +415,10 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   Future<void> _changeInstrument(int program) async {
     if (program == _selectedInstrument) return;
+    _stopPlaybackSync();
     setState(() => _selectedInstrument = program);
     await _savePrefsForCurrentFile();
     _toggleBar();
-    if (_isPlaying) {
-      await _stopPlayback();
-    }
   }
 
   Future<void> _changeTempo(int delta) async {
@@ -379,7 +426,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
     if (next == _tempoBpm) return;
     setState(() => _tempoBpm = next);
     await _savePrefsForCurrentFile();
-    if (_sequencer != null && _audioReady) {
+    if (_isPlaying && _sequencer != null) {
       try {
         await _sequencer!.setSpeed(next / 120.0);
       } catch (e) {
@@ -424,23 +471,37 @@ class _VerovioScreenState extends State<VerovioScreen> {
     }
   }
 
-  Future<void> _stopPlayback() async {
-    if (!_isPlaying) return;
-    try {
-      await _sequencer?.stop();
-    } catch (_) {}
+  /// Usuwa sufiks "-rend" z ID nuty (Verovio dodaje go przy repetycji).
+  String _stripRend(String id) {
+    final idx = id.indexOf('-rend');
+    return idx >= 0 ? id.substring(0, idx) : id;
+  }
+
+  /// Synchronous stop — bez czekania na stop() (bo blokuje iOS).
+  void _stopPlaybackSync() {
     _playbackMonitor?.cancel();
-    if (!mounted) return;
-    setState(() => _isPlaying = false);
+    _playbackMonitor = null;
+    _highlightTimer?.cancel();
+    _highlightTimer = null;
+    AudioSingleton.markStopped();
+    if (mounted) {
+      setState(() => _isPlaying = false);
+    }
+    try {
+      _webController?.runJavaScript(
+          'window.__clearHighlights && window.__clearHighlights();');
+    } catch (_) {}
   }
 
   Future<void> _togglePlayback() async {
-    if (!_audioReady || _sequencer == null || _service == null) {
+    if (!_audioReady || _service == null) {
       debugPrint('Audio jeszcze nie gotowe');
       return;
     }
+
+    // Jeśli gra — zatrzymaj
     if (_isPlaying) {
-      await _stopPlayback();
+      _stopPlaybackSync();
       return;
     }
 
@@ -454,16 +515,25 @@ class _VerovioScreenState extends State<VerovioScreen> {
       final modified = _applyInstrumentToMidi(midiBytes, _selectedInstrument);
 
       final tempDir = await getTemporaryDirectory();
-      final midiFile = File('${tempDir.path}/current.mid');
+      final midiFile = File(
+        '${tempDir.path}/current_${DateTime.now().millisecondsSinceEpoch}.mid',
+      );
       await midiFile.writeAsBytes(modified);
 
       if (!mounted) return;
       setState(() => _isPlaying = true);
+      AudioSingleton.markPlaying();
       _toggleBar();
 
-      await _sequencer!.setSpeed(_tempoBpm / 120.0);
-      await _sequencer!.play(midiPath: midiFile.path);
+      // Utwórz NOWĄ instancję sequencera — bez stop() (bo blokuje iOS)
+      _sequencer = await AudioSingleton.recreate();
 
+      await _sequencer!.setSpeed(_tempoBpm / 120.0);
+      debugPrint('Wywołuję play() z pliku: ${midiFile.path}');
+      await _sequencer!.play(midiPath: midiFile.path);
+      debugPrint('play() zakończone');
+
+      // Monitor końca utworu (co 500 ms)
       _playbackMonitor?.cancel();
       _playbackMonitor = Timer.periodic(
         const Duration(milliseconds: 500),
@@ -472,16 +542,61 @@ class _VerovioScreenState extends State<VerovioScreen> {
             timer.cancel();
             return;
           }
-          final done = _sequencer!.endOfSequence;
-          if (done) {
+          if (_sequencer!.endOfSequence) {
             timer.cancel();
+            _playbackMonitor = null;
+            _highlightTimer?.cancel();
+            _highlightTimer = null;
+            debugPrint('Koniec utworu');
+            AudioSingleton.markStopped();
+            if (!mounted) return;
             setState(() => _isPlaying = false);
+            try {
+              await _webController?.runJavaScript(
+                  'window.__clearHighlights && window.__clearHighlights();');
+            } catch (_) {}
           }
+        },
+      );
+
+      // Podświetlanie nut (co 80 ms) — z obsługą repetycji (-rend)
+      _highlightTimer?.cancel();
+      _highlightTimer = Timer.periodic(
+        const Duration(milliseconds: 80),
+        (timer) async {
+          if (!mounted || !_isPlaying) {
+            timer.cancel();
+            return;
+          }
+          try {
+            final posSeconds = _sequencer!.position;
+            final posMs = (posSeconds * 1000).round();
+            final jsonStr = await _service!.getElementsAtTime(posMs);
+            debugPrint('ELEMENTS [$posMs]: $jsonStr');
+            if (jsonStr.isEmpty) return;
+
+            final data = jsonDecode(jsonStr) as Map<String, dynamic>;
+            final notes = (data['notes'] as List?) ?? [];
+            final rests = (data['rests'] as List?) ?? [];
+            final chords = (data['chords'] as List?) ?? [];
+
+            final allIds = <String>[
+              ...notes.map((e) => _stripRend(e.toString())),
+              ...rests.map((e) => _stripRend(e.toString())),
+              ...chords.map((e) => _stripRend(e.toString())),
+            ];
+            if (allIds.isEmpty) return;
+
+            final jsIds = allIds.map((e) => '"$e"').join(',');
+            final js =
+                'window.__highlightNotes && window.__highlightNotes([$jsIds]);';
+            await _webController!.runJavaScript(js);
+          } catch (_) {}
         },
       );
     } catch (e) {
       debugPrint('Błąd odtwarzania: $e');
-      if (mounted) setState(() => _isPlaying = false);
+      _stopPlaybackSync();
     }
   }
 
@@ -501,6 +616,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
               onTap: _toggleBar,
             ),
           ),
+          // ── GÓRNY PASEK ───────────────────────────────────────
           AnimatedPositioned(
             duration: const Duration(milliseconds: 250),
             curve: Curves.easeOut,
@@ -511,162 +627,129 @@ class _VerovioScreenState extends State<VerovioScreen> {
               bottom: false,
               child: Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-                color: Colors.black.withValues(alpha: 0.78),
+                    const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                color: Colors.black.withValues(alpha: 0.82),
                 child: Row(
                   children: [
-                    IconButton(
-                      icon: const Icon(Icons.arrow_back,
-                          color: Colors.white, size: 20),
-                      padding: EdgeInsets.zero,
-                      constraints:
-                          const BoxConstraints(minWidth: 34, minHeight: 34),
-                      onPressed: () async {
-                        await _stopPlayback();
-                        if (!mounted) return;
+                    _iconBtn(
+                      icon: Icons.arrow_back,
+                      onPressed: () {
+                        _stopPlaybackSync();
+                        _hideTimer?.cancel();
                         Navigator.pop(context);
                       },
                       tooltip: 'Wróć',
                     ),
                     if (_hasNavigation)
                       Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 4),
+                        padding: const EdgeInsets.symmetric(horizontal: 2),
                         child: Text(
                           '${_currentIndex + 1}/${_navList.length}',
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 12,
+                            fontSize: 11,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
                       ),
+                    const SizedBox(width: 2),
                     _miniLabel('Z'),
-                    _stepBtn(
+                    _tinyBtn(
                       icon: Icons.remove,
                       onPressed: () => _changeZoom(-5),
                     ),
-                    _valueBox('$_zoomValue'),
-                    _stepBtn(
+                    _tinyBox('$_zoomValue'),
+                    _tinyBtn(
                       icon: Icons.add,
                       onPressed: () => _changeZoom(5),
                     ),
-                    const SizedBox(width: 6),
+                    const SizedBox(width: 4),
                     _miniLabel('W'),
-                    _stepBtn(
+                    _tinyBtn(
                       icon: Icons.remove,
                       onPressed: () => _changeSpacing(-1),
                     ),
-                    _valueBox(_spacingValue > 0
+                    _tinyBox(_spacingValue > 0
                         ? '+$_spacingValue'
                         : '$_spacingValue'),
-                    _stepBtn(
+                    _tinyBtn(
                       icon: Icons.add,
                       onPressed: () => _changeSpacing(1),
                     ),
-                    const SizedBox(width: 6),
-                    _toggleBtn(
+                    const SizedBox(width: 4),
+                    _compactToggle(
                       label: _viewLabels[_viewMode] ?? 'N',
                       active: _viewMode == 'both',
                       onPressed: _cycleViewMode,
                     ),
-                    const SizedBox(width: 6),
-                    Container(
-                      height: 30,
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      decoration: BoxDecoration(
-                        color: Colors.white12,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: _transposeValue,
-                          dropdownColor: Colors.black87,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 12),
-                          icon: const Icon(Icons.arrow_drop_down,
-                              color: Colors.white, size: 16),
-                          items: _keyLabels.entries
-                              .map((e) => DropdownMenuItem<String>(
-                                    value: e.key,
-                                    child: Text(e.value),
-                                  ))
-                              .toList(),
-                          onChanged: (v) {
-                            if (v != null) _changeTranspose(v);
-                          },
-                        ),
-                      ),
+                    const SizedBox(width: 4),
+                    _compactDropdown<String>(
+                      value: _transposeValue,
+                      items: _keyLabels.entries
+                          .map((e) => DropdownMenuItem<String>(
+                                value: e.key,
+                                child: Text(e.value),
+                              ))
+                          .toList(),
+                      onChanged: (v) {
+                        if (v != null) _changeTranspose(v);
+                      },
                     ),
-                    const SizedBox(width: 6),
-                    Container(
-                      height: 30,
-                      padding: const EdgeInsets.symmetric(horizontal: 4),
-                      decoration: BoxDecoration(
-                        color: Colors.white12,
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: Colors.white24),
-                      ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<int>(
-                          value: _selectedInstrument,
-                          dropdownColor: Colors.black87,
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 12),
-                          icon: const Icon(Icons.arrow_drop_down,
-                              color: Colors.white, size: 16),
-                          items: _instruments.entries
-                              .map((e) => DropdownMenuItem<int>(
-                                    value: e.key,
-                                    child: Text(e.value),
-                                  ))
-                              .toList(),
-                          onChanged: (v) {
-                            if (v != null) _changeInstrument(v);
-                          },
-                        ),
-                      ),
+                    const SizedBox(width: 4),
+                    _compactDropdown<int>(
+                      value: _selectedInstrument,
+                      items: _instruments.entries
+                          .map((e) => DropdownMenuItem<int>(
+                                value: e.key,
+                                child: Text(e.value),
+                              ))
+                          .toList(),
+                      onChanged: (v) {
+                        if (v != null) _changeInstrument(v);
+                      },
                     ),
-                    const SizedBox(width: 6),
+                    const SizedBox(width: 4),
                     GestureDetector(
                       onTap: () => _showTempoDialog(),
                       child: Container(
-                        height: 30,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        height: 26,
+                        padding: const EdgeInsets.symmetric(horizontal: 5),
                         alignment: Alignment.center,
                         decoration: BoxDecoration(
                           color: Colors.white12,
-                          borderRadius: BorderRadius.circular(4),
+                          borderRadius: BorderRadius.circular(3),
                           border: Border.all(color: Colors.white24),
                         ),
                         child: Text(
-                          'T ${_tempoBpm}',
+                          '$_tempoBpm',
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 12,
+                            fontSize: 11,
                             fontWeight: FontWeight.w700,
                           ),
                         ),
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    IconButton(
-                      icon: Icon(
-                        _isPlaying ? Icons.pause : Icons.play_arrow,
-                        color: _audioReady ? Colors.white : Colors.white38,
-                        size: 24,
-                      ),
-                      padding: EdgeInsets.zero,
-                      constraints:
-                          const BoxConstraints(minWidth: 34, minHeight: 34),
+                    const SizedBox(width: 2),
+                    _iconBtn(
+                      icon: Icons.stop,
+                      onPressed:
+                          (_audioReady && _isPlaying) ? _stopPlaybackSync : null,
+                      tooltip: 'Stop',
+                      enabled: _audioReady && _isPlaying,
+                    ),
+                    _iconBtn(
+                      icon: _isPlaying ? Icons.pause : Icons.play_arrow,
                       onPressed: _audioReady ? _togglePlayback : null,
                       tooltip: _isPlaying ? 'Pauza' : 'Odtwórz',
+                      enabled: _audioReady,
                     ),
                   ],
                 ),
               ),
             ),
           ),
+          // ── DOLNY PASEK NAWIGACJI ──────────────────────────────
           if (_hasNavigation)
             AnimatedPositioned(
               duration: const Duration(milliseconds: 250),
@@ -679,7 +762,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
                 child: Container(
                   padding:
                       const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                  color: Colors.black.withValues(alpha: 0.78),
+                  color: Colors.black.withValues(alpha: 0.82),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -689,11 +772,11 @@ class _VerovioScreenState extends State<VerovioScreen> {
                           color: _currentIndex > 0
                               ? Colors.white
                               : Colors.white30,
-                          size: 24,
+                          size: 22,
                         ),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 44, minHeight: 44),
+                            const BoxConstraints(minWidth: 40, minHeight: 40),
                         onPressed:
                             _currentIndex > 0 ? () => _navigate(-1) : null,
                         tooltip: 'Poprzedni',
@@ -707,7 +790,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
                           ),
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 13,
+                            fontSize: 12,
                             fontWeight: FontWeight.w600,
                           ),
                           textAlign: TextAlign.center,
@@ -720,11 +803,11 @@ class _VerovioScreenState extends State<VerovioScreen> {
                           color: _currentIndex < _navList.length - 1
                               ? Colors.white
                               : Colors.white30,
-                          size: 24,
+                          size: 22,
                         ),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 44, minHeight: 44),
+                            const BoxConstraints(minWidth: 40, minHeight: 40),
                         onPressed: _currentIndex < _navList.length - 1
                             ? () => _navigate(1)
                             : null,
@@ -812,20 +895,22 @@ class _VerovioScreenState extends State<VerovioScreen> {
     _scheduleHide();
   }
 
+  // ── MAŁE KOMPONENTY PASKA ─────────────────────────────────────
+
   Widget _miniLabel(String text) => Padding(
-        padding: const EdgeInsets.only(right: 3),
+        padding: const EdgeInsets.only(right: 2, left: 2),
         child: Text(text,
             style: const TextStyle(
                 color: Colors.white70,
-                fontSize: 11,
+                fontSize: 10,
                 fontWeight: FontWeight.w600)),
       );
 
-  Widget _valueBox(String text) => Container(
-        constraints: const BoxConstraints(minWidth: 32),
+  Widget _tinyBox(String text) => Container(
+        constraints: const BoxConstraints(minWidth: 26),
         alignment: Alignment.center,
-        margin: const EdgeInsets.symmetric(horizontal: 2),
-        padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 4),
+        margin: const EdgeInsets.symmetric(horizontal: 1),
+        padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
         decoration: BoxDecoration(
           color: Colors.white12,
           borderRadius: BorderRadius.circular(3),
@@ -833,23 +918,45 @@ class _VerovioScreenState extends State<VerovioScreen> {
         child: Text(text,
             style: const TextStyle(
                 color: Colors.white,
-                fontSize: 11,
+                fontSize: 10,
                 fontWeight: FontWeight.w600)),
       );
 
-  Widget _stepBtn({required IconData icon, VoidCallback? onPressed}) =>
+  Widget _tinyBtn({required IconData icon, VoidCallback? onPressed}) =>
       SizedBox(
-        width: 28,
-        height: 28,
+        width: 24,
+        height: 24,
         child: IconButton(
-          icon: Icon(icon, color: Colors.white, size: 16),
+          icon: Icon(icon, color: Colors.white, size: 14),
           padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+          constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
           onPressed: onPressed,
         ),
       );
 
-  Widget _toggleBtn({
+  Widget _iconBtn({
+    required IconData icon,
+    VoidCallback? onPressed,
+    required String tooltip,
+    bool enabled = true,
+  }) =>
+      SizedBox(
+        width: 30,
+        height: 30,
+        child: IconButton(
+          icon: Icon(
+            icon,
+            color: enabled ? Colors.white : Colors.white38,
+            size: 20,
+          ),
+          padding: EdgeInsets.zero,
+          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
+          onPressed: onPressed,
+          tooltip: tooltip,
+        ),
+      );
+
+  Widget _compactToggle({
     required String label,
     required bool active,
     required VoidCallback onPressed,
@@ -857,12 +964,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
       GestureDetector(
         onTap: onPressed,
         child: Container(
-          width: 40,
-          height: 28,
+          width: 32,
+          height: 26,
           alignment: Alignment.center,
           decoration: BoxDecoration(
             color: active ? const Color(0xFFd6ad23) : Colors.white12,
-            borderRadius: BorderRadius.circular(4),
+            borderRadius: BorderRadius.circular(3),
             border: Border.all(
               color: active ? const Color(0xFFffe889) : Colors.white24,
             ),
@@ -871,9 +978,36 @@ class _VerovioScreenState extends State<VerovioScreen> {
             label,
             style: TextStyle(
               color: active ? Colors.black : Colors.white,
-              fontSize: 12,
+              fontSize: 11,
               fontWeight: FontWeight.w700,
             ),
+          ),
+        ),
+      );
+
+  Widget _compactDropdown<T>({
+    required T value,
+    required List<DropdownMenuItem<T>> items,
+    required void Function(T?) onChanged,
+  }) =>
+      Container(
+        height: 26,
+        padding: const EdgeInsets.symmetric(horizontal: 3),
+        decoration: BoxDecoration(
+          color: Colors.white12,
+          borderRadius: BorderRadius.circular(3),
+          border: Border.all(color: Colors.white24),
+        ),
+        child: DropdownButtonHideUnderline(
+          child: DropdownButton<T>(
+            value: value,
+            dropdownColor: Colors.black87,
+            style: const TextStyle(color: Colors.white, fontSize: 11),
+            icon: const Icon(Icons.arrow_drop_down,
+                color: Colors.white, size: 14),
+            isDense: true,
+            items: items,
+            onChanged: onChanged,
           ),
         ),
       );
