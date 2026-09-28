@@ -1,14 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'package:dart_midi_pro/dart_midi_pro.dart';
+import 'package:archive/archive.dart';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/material.dart';
+import 'package:photo_view/photo_view.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:rush_synth/rush_synth.dart';
+import 'package:saf/saf.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:xml/xml.dart';
 import 'package:verovio_flutter/verovio_flutter.dart';
 
+import 'chords_screen.dart';
 import 'singletons.dart';
 
 class VerovioScreen extends StatefulWidget {
@@ -32,27 +37,32 @@ class VerovioScreen extends StatefulWidget {
 class _VerovioScreenState extends State<VerovioScreen> {
   VerovioAsyncService? _service;
   WebViewController? _webController;
-  RushSequencer? _sequencer;
+
+  final Saf _saf = Saf();
+  final AudioPlayer _audioPlayer = AudioPlayer();
+  String? _audioFolderUri;
+  String? _audioUri;
+  String? _audioTempPath;
+  bool _audioPlaying = false;
+  bool _audioPaused = false;
+  DateTime? _lastPlayPress;
 
   bool _barVisible = true;
   Timer? _hideTimer;
+  Timer? _immersiveTimer;
 
   int _zoomValue = 70;
   int _spacingValue = 0;
   String _transposeValue = '';
+  int _octaveShift = 0;
   String _viewMode = 'notes';
-
-  bool _audioReady = false;
-  bool _isPlaying = false;
-  Timer? _playbackMonitor;
-  Timer? _highlightTimer;
-
-  int _selectedInstrument = 11;
-  int _tempoBpm = 120;
+  String _selectedFont = 'Leipzig';
 
   late List<String> _navList;
   late int _currentIndex;
   late String _currentPath;
+
+  static const String _prefsAudioFolder = 'audio_folder_uri';
 
   static const Map<String, String> _keyLabels = {
     '': 'ORG',
@@ -75,13 +85,11 @@ class _VerovioScreenState extends State<VerovioScreen> {
     'both': 'NA',
   };
 
-  static const Map<int, String> _instruments = {
-    0: 'Fortepian',
-    11: 'Wibrafon',
-    56: 'Trąbka',
-    65: 'Saksofon altowy',
-    71: 'Klarnet',
-    73: 'Flet',
+  static const Map<String, String> _fontLabels = {
+    'Leipzig': 'Leipzig',
+    'Bravura': 'Bravura',
+    'Leland': 'Leland',
+    'Petaluma': 'Petaluma',
   };
 
   String get _fileKey => _currentPath.split('/').last;
@@ -90,25 +98,71 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   bool get _hasNavigation => _navList.length > 1;
 
+  /// Czy bieżący plik to obraz (PNG/JPG/WEBP)?
+  bool get _isImage {
+    final p = _currentPath.toLowerCase();
+    return p.endsWith('.png') ||
+        p.endsWith('.jpg') ||
+        p.endsWith('.jpeg') ||
+        p.endsWith('.webp');
+  }
+
+  String get _cleanTitle {
+    var name = _fileKey.replaceAll(
+      RegExp(r'\.(xml|mxl|musicxml|mei|png|jpg|jpeg|webp)$', caseSensitive: false),
+      '',
+    );
+    final parts = name.split('_');
+    if (parts.length > 1 && int.tryParse(parts.first) != null) {
+      name = parts.sublist(1).join(' ');
+    }
+    return name.replaceAll('_', ' ');
+  }
+
+  String get _effectiveTranspose {
+    if (_transposeValue.isEmpty) {
+      if (_octaveShift == 0) return '';
+      return _octaveShift > 0 ? 'P8' : '-P8';
+    }
+    if (_octaveShift == 0) return _transposeValue;
+    if (_octaveShift > 0) {
+      return '+$_transposeValue';
+    } else {
+      return '-$_transposeValue';
+    }
+  }
+
   @override
   void initState() {
     super.initState();
     _currentPath = widget.filePath;
     _currentIndex = widget.currentIndex;
     _navList = widget.navigationList ?? [widget.filePath];
+
+    _audioPlayer.onPlayerComplete.listen((_) {
+      if (!mounted) return;
+      setState(() {
+        _audioPlaying = false;
+        _audioPaused = false;
+      });
+    });
+
     _loadPrefsForCurrentFile().then((_) => _init());
     _scheduleHide();
+
+    // Po 3 sekundach przejdź w tryb pełnoekranowy (ukryj paski systemowe)
+    _immersiveTimer = Timer(const Duration(seconds: 3), () {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    });
   }
 
   @override
   void dispose() {
     _hideTimer?.cancel();
-    _playbackMonitor?.cancel();
-    _highlightTimer?.cancel();
-    _playbackMonitor = null;
-    _highlightTimer = null;
-    // Fire and forget — wycisz wszystkie silniki
-    AudioSingleton.panic();
+    _immersiveTimer?.cancel();
+    // Przywróć paski systemowe przy wyjściu z ekranu
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    _audioPlayer.dispose();
     super.dispose();
   }
 
@@ -118,13 +172,13 @@ class _VerovioScreenState extends State<VerovioScreen> {
     _zoomValue = _zoomValue.clamp(40, 140);
     _spacingValue = (prefs.getInt(_prefsKey('spacing')) ?? 0).clamp(0, 20);
     _transposeValue = prefs.getString(_prefsKey('transpose')) ?? '';
+    _octaveShift = (prefs.getInt(_prefsKey('octave')) ?? 0).clamp(-1, 1);
     _viewMode = prefs.getString(_prefsKey('viewMode')) ?? 'notes';
     if (!_viewLabels.containsKey(_viewMode)) _viewMode = 'notes';
-    _selectedInstrument = prefs.getInt(_prefsKey('instrument')) ?? 11;
-    if (!_instruments.containsKey(_selectedInstrument)) {
-      _selectedInstrument = 11;
-    }
-    _tempoBpm = (prefs.getInt(_prefsKey('tempo')) ?? 120).clamp(40, 240);
+    _selectedFont = prefs.getString(_prefsKey('font')) ?? 'Leipzig';
+    if (!_fontLabels.containsKey(_selectedFont)) _selectedFont = 'Leipzig';
+
+    _audioFolderUri = prefs.getString(_prefsAudioFolder);
   }
 
   Future<void> _savePrefsForCurrentFile() async {
@@ -132,9 +186,9 @@ class _VerovioScreenState extends State<VerovioScreen> {
     await prefs.setInt(_prefsKey('zoom'), _zoomValue);
     await prefs.setInt(_prefsKey('spacing'), _spacingValue);
     await prefs.setString(_prefsKey('transpose'), _transposeValue);
+    await prefs.setInt(_prefsKey('octave'), _octaveShift);
     await prefs.setString(_prefsKey('viewMode'), _viewMode);
-    await prefs.setInt(_prefsKey('instrument'), _selectedInstrument);
-    await prefs.setInt(_prefsKey('tempo'), _tempoBpm);
+    await prefs.setString(_prefsKey('font'), _selectedFont);
   }
 
   int _clampZoom(int v) => ((v / 5).round() * 5).clamp(40, 140);
@@ -168,24 +222,166 @@ class _VerovioScreenState extends State<VerovioScreen> {
         _webController = controller;
       });
 
-      await _initAudio();
+      if (_audioFolderUri == null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _showPickAudioFolderDialog();
+        });
+      }
+
       await _renderCurrentFile();
     } catch (e) {
       debugPrint('Błąd inicjalizacji: $e');
     }
   }
 
-  Future<void> _initAudio() async {
+  Future<void> _pickAudioFolder() async {
     try {
-      final seq = await AudioSingleton.get();
+      final dir = await _saf.pickDirectory();
+      if (dir == null) return;
+      _audioFolderUri = dir.uri;
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_prefsAudioFolder, _audioFolderUri!);
+      debugPrint('Audio folder: $_audioFolderUri');
       if (!mounted) return;
-      setState(() {
-        _sequencer = seq;
-        _audioReady = true;
-      });
-      debugPrint('Audio gotowe (singleton)');
+      setState(() {});
+      await _renderCurrentFile();
     } catch (e) {
-      debugPrint('Błąd audio: $e');
+      debugPrint('Błąd wyboru folderu audio: $e');
+    }
+  }
+
+  Future<void> _showPickAudioFolderDialog() async {
+    if (!mounted) return;
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Folder z plikami MP3'),
+        content: const Text(
+          'Wybierz folder, w którym trzymasz pliki MP3 do odtwarzania.\n\n'
+          'Pliki MP3 muszą mieć taką samą nazwę jak pliki XML/MXL '
+          '(np. 01_Cicha_noc.mxl → 01_Cicha_noc.mp3).',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Później'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Wybierz folder'),
+          ),
+        ],
+      ),
+    );
+    if (result == true) {
+      await _pickAudioFolder();
+    }
+  }
+
+  Future<String?> _findAudioFor(String fileName) async {
+    if (_audioFolderUri == null) return null;
+    try {
+      final mp3Name = fileName.replaceAll(
+        RegExp(r'\.(xml|mxl|musicxml|mei|png|jpg|jpeg|webp)$', caseSensitive: false),
+        '.mp3',
+      );
+      final files = await _saf.list(_audioFolderUri!);
+      for (final f in files) {
+        if (f.name.toLowerCase() == mp3Name.toLowerCase()) {
+          debugPrint('Znaleziono MP3: ${f.name}');
+          return f.uri;
+        }
+      }
+      debugPrint('Brak MP3 dla $mp3Name');
+      return null;
+    } catch (e) {
+      debugPrint('Błąd szukania MP3: $e');
+      return null;
+    }
+  }
+
+  Future<void> _onAudioPressed() async {
+    if (_audioUri == null) return;
+
+    final now = DateTime.now();
+
+    if (_lastPlayPress != null &&
+        now.difference(_lastPlayPress!).inMilliseconds < 400) {
+      _lastPlayPress = null;
+      try {
+        if (_audioPlaying) {
+          await _audioPlayer.pause();
+          if (mounted) {
+            setState(() {
+              _audioPaused = true;
+              _audioPlaying = false;
+            });
+          }
+        }
+      } catch (e) {
+        debugPrint('Błąd pauzy: $e');
+      }
+      return;
+    }
+    _lastPlayPress = now;
+
+    Future.delayed(const Duration(milliseconds: 400), () async {
+      if (_lastPlayPress != now) return;
+      _lastPlayPress = null;
+
+      try {
+        if (_audioPaused) {
+          await _audioPlayer.resume();
+          if (mounted) {
+            setState(() {
+              _audioPaused = false;
+              _audioPlaying = true;
+            });
+          }
+          return;
+        }
+
+        if (_audioPlaying) {
+          await _audioPlayer.stop();
+          await _audioPlayer.seek(Duration.zero);
+          if (mounted) {
+            setState(() {
+              _audioPlaying = false;
+              _audioPaused = false;
+            });
+          }
+          return;
+        }
+
+        final bytes = await _saf.readFileBytes(_audioUri!);
+        final tempDir = await getTemporaryDirectory();
+        final tempFile = File('${tempDir.path}/audio_current.mp3');
+        await tempFile.writeAsBytes(Uint8List.fromList(bytes));
+        _audioTempPath = tempFile.path;
+
+        await _audioPlayer.stop();
+        await _audioPlayer.play(DeviceFileSource(_audioTempPath!));
+        if (mounted) {
+          setState(() {
+            _audioPlaying = true;
+            _audioPaused = false;
+          });
+        }
+      } catch (e) {
+        debugPrint('Błąd audio: $e');
+      }
+    });
+  }
+
+  Future<void> _stopAudio() async {
+    try {
+      await _audioPlayer.stop();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _audioPlaying = false;
+        _audioPaused = false;
+      });
     }
   }
 
@@ -195,11 +391,74 @@ class _VerovioScreenState extends State<VerovioScreen> {
     return (base * scaleFactor).round().clamp(600, 6000);
   }
 
+  /// Wyciąga oryginalną tonikę z XML (fifths → nazwa dur).
+  Future<String> _extractOriginalKey(String path) async {
+    try {
+      final bytes = await File(path).readAsBytes();
+      final isMxl = path.toLowerCase().endsWith('.mxl');
+
+      String xmlContent;
+      if (isMxl) {
+        final archive = ZipDecoder().decodeBytes(bytes);
+        final xmlFile = archive.files.firstWhere(
+          (f) =>
+              !f.name.toUpperCase().startsWith('META-INF/') &&
+              (f.name.toLowerCase().endsWith('.xml') ||
+                  f.name.toLowerCase().endsWith('.musicxml')),
+          orElse: () => throw Exception('Brak XML w MXL'),
+        );
+        xmlContent = utf8.decode(xmlFile.content);
+      } else {
+        xmlContent = utf8.decode(bytes);
+      }
+
+      final doc = XmlDocument.parse(xmlContent);
+      final keyEl = doc.findAllElements('key').firstOrNull;
+      if (keyEl == null) return '';
+
+      final fifths =
+          int.tryParse(keyEl.getElement('fifths')?.innerText ?? '0') ?? 0;
+
+      const map = {
+        -7: 'c',
+        -6: 'fs',
+        -5: 'df',
+        -4: 'af',
+        -3: 'ef',
+        -2: 'bf',
+        -1: 'f',
+        0: 'c',
+        1: 'g',
+        2: 'd',
+        3: 'a',
+        4: 'e',
+        5: 'b',
+        6: 'fs',
+        7: 'df',
+      };
+      return map[fifths] ?? '';
+    } catch (e) {
+      debugPrint('Błąd ekstrakcji tonacji: $e');
+      return '';
+    }
+  }
+
   Future<void> _renderCurrentFile() async {
     _toggleBar();
 
     try {
       final screenWidth = MediaQuery.of(context).size.width;
+
+      // Zapisz oryginalną tonikę (raz — tylko jeśli nie zapisana)
+      final prefs = await SharedPreferences.getInstance();
+      final origKey = 'viewer-original-key-$_fileKey';
+      if (prefs.getString(origKey) == null) {
+        final extracted = await _extractOriginalKey(_currentPath);
+        if (extracted.isNotEmpty) {
+          await prefs.setString(origKey, extracted);
+          debugPrint('=== Zapisano oryginalną tonikę: $extracted');
+        }
+      }
 
       final options = <String, Object?>{
         'scale': _zoomValue,
@@ -210,7 +469,8 @@ class _VerovioScreenState extends State<VerovioScreen> {
         'header': 'none',
         'mnumInterval': 0,
         'spacingSystem': _spacingValue > 0 ? _spacingValue : 2,
-        'transpose': _transposeValue,
+        'transpose': _effectiveTranspose,
+        'font': _selectedFont,
       };
       await _service!.setOptionsJson(jsonEncode(options));
 
@@ -233,6 +493,17 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
       await _webController!.loadHtmlString(_svgHtmlWithSpacing(svg));
       if (!mounted) return;
+
+      final audioUri = await _findAudioFor(_fileKey);
+      if (!mounted) return;
+      setState(() {
+        _audioUri = audioUri;
+        if (audioUri == null) {
+          _audioPlaying = false;
+          _audioPaused = false;
+        }
+      });
+
       _toggleBar();
     } catch (e) {
       debugPrint('Błąd: $e');
@@ -244,12 +515,15 @@ class _VerovioScreenState extends State<VerovioScreen> {
     final newIndex = _currentIndex + direction;
     if (newIndex < 0 || newIndex >= _navList.length) return;
 
-    await _panic();
+    await _stopAudio();
     await _savePrefsForCurrentFile();
 
     setState(() {
       _currentIndex = newIndex;
       _currentPath = _navList[newIndex];
+      _audioUri = null;
+      _audioPlaying = false;
+      _audioPaused = false;
     });
 
     await widget.onFileChanged?.call(_currentPath);
@@ -290,7 +564,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
     sb.writeln('(function() {');
     sb.writeln('  var spacingValue = $_spacingValue;');
     sb.writeln('  var viewMode = "$_viewMode";');
-    sb.writeln('  var previousHighlighted = [];');
     sb.writeln('  function applySettings() {');
     sb.writeln('    var svg = document.querySelector("svg");');
     sb.writeln('    if (!svg) return;');
@@ -331,53 +604,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
     sb.writeln('    }');
     sb.writeln('  }');
     sb.writeln('  window.__applySettings = applySettings;');
-    sb.writeln('  function restoreElement(el) {');
-    sb.writeln('    el.removeAttribute("fill");');
-    sb.writeln('    el.removeAttribute("stroke");');
-    sb.writeln('    el.style.fill = "";');
-    sb.writeln('    el.style.stroke = "";');
-    sb.writeln('    var descendants = el.querySelectorAll("*");');
-    sb.writeln('    descendants.forEach(function(d) {');
-    sb.writeln('      d.removeAttribute("fill");');
-    sb.writeln('      d.removeAttribute("stroke");');
-    sb.writeln('      d.style.fill = "";');
-    sb.writeln('      d.style.stroke = "";');
-    sb.writeln('    });');
-    sb.writeln('  }');
-    sb.writeln('  function paintElement(el) {');
-    sb.writeln('    el.setAttribute("fill", "red");');
-    sb.writeln('    el.setAttribute("stroke", "red");');
-    sb.writeln('    el.style.fill = "red";');
-    sb.writeln('    el.style.stroke = "red";');
-    sb.writeln('    var descendants = el.querySelectorAll("*");');
-    sb.writeln('    descendants.forEach(function(d) {');
-    sb.writeln('      d.setAttribute("fill", "red");');
-    sb.writeln('      d.setAttribute("stroke", "red");');
-    sb.writeln('      d.style.fill = "red";');
-    sb.writeln('      d.style.stroke = "red";');
-    sb.writeln('    });');
-    sb.writeln('  }');
-    sb.writeln('  window.__highlightNotes = function(ids) {');
-    sb.writeln('    previousHighlighted.forEach(function(id) {');
-    sb.writeln('      var el = document.getElementById(id);');
-    sb.writeln('      if (el) restoreElement(el);');
-    sb.writeln('    });');
-    sb.writeln('    previousHighlighted = [];');
-    sb.writeln('    ids.forEach(function(id) {');
-    sb.writeln('      var el = document.getElementById(id);');
-    sb.writeln('      if (el) {');
-    sb.writeln('        paintElement(el);');
-    sb.writeln('        previousHighlighted.push(id);');
-    sb.writeln('      }');
-    sb.writeln('    });');
-    sb.writeln('  };');
-    sb.writeln('  window.__clearHighlights = function() {');
-    sb.writeln('    previousHighlighted.forEach(function(id) {');
-    sb.writeln('      var el = document.getElementById(id);');
-    sb.writeln('      if (el) restoreElement(el);');
-    sb.writeln('    });');
-    sb.writeln('    previousHighlighted = [];');
-    sb.writeln('  };');
     sb.writeln('  setTimeout(applySettings, 50);');
     sb.writeln('})();');
     sb.writeln('</script>');
@@ -412,26 +638,25 @@ class _VerovioScreenState extends State<VerovioScreen> {
     await _renderCurrentFile();
   }
 
-  Future<void> _changeInstrument(int program) async {
-    if (program == _selectedInstrument) return;
-    await _panic();
-    setState(() => _selectedInstrument = program);
+  Future<void> _changeOctave(int direction) async {
+    setState(() {
+      if (_octaveShift == direction) {
+        _octaveShift = 0;
+      } else {
+        _octaveShift = direction;
+      }
+    });
     await _savePrefsForCurrentFile();
     _toggleBar();
+    await _renderCurrentFile();
   }
 
-  Future<void> _changeTempo(int delta) async {
-    final next = (_tempoBpm + delta).clamp(40, 240);
-    if (next == _tempoBpm) return;
-    setState(() => _tempoBpm = next);
+  Future<void> _changeFont(String font) async {
+    if (font == _selectedFont) return;
+    setState(() => _selectedFont = font);
     await _savePrefsForCurrentFile();
-    if (_isPlaying && _sequencer != null) {
-      try {
-        await _sequencer!.setSpeed(next / 120.0);
-      } catch (e) {
-        debugPrint('Błąd zmiany tempa: $e');
-      }
-    }
+    _toggleBar();
+    await _renderCurrentFile();
   }
 
   Future<void> _cycleViewMode() async {
@@ -444,173 +669,25 @@ class _VerovioScreenState extends State<VerovioScreen> {
     await _renderCurrentFile();
   }
 
-  List<int> _applyInstrumentToMidi(List<int> midiBytes, int program) {
-    try {
-      final parser = MidiParser();
-      final file = parser.parseMidiFromBuffer(midiBytes);
-      for (final track in file.tracks) {
-        final programEvents = track.whereType<ProgramChangeMidiEvent>();
-        if (programEvents.isNotEmpty) {
-          for (final ev in programEvents) {
-            ev.programNumber = program;
-          }
-        } else {
-          final pc = ProgramChangeMidiEvent()
-            ..channel = 0
-            ..programNumber = program
-            ..deltaTime = 0;
-          track.insert(0, pc);
-        }
-      }
-      final writer = MidiWriter();
-      return writer.writeMidiToBuffer(file);
-    } catch (e) {
-      debugPrint('Błąd modyfikacji MIDI: $e');
-      return midiBytes;
-    }
-  }
-
-  /// Usuwa sufiks "-rend" z ID nuty (Verovio dodaje go przy repetycji).
-  String _stripRend(String id) {
-    final idx = id.indexOf('-rend');
-    return idx >= 0 ? id.substring(0, idx) : id;
-  }
-
-  /// PANIC — wycisz wszystkie silniki audio i zatrzymaj timery.
-  /// To jest jedyny sposób, żeby uciszyć stare instancje (bo stop() blokuje iOS).
-  Future<void> _panic() async {
-    _playbackMonitor?.cancel();
-    _playbackMonitor = null;
-    _highlightTimer?.cancel();
-    _highlightTimer = null;
-    await AudioSingleton.panic();
-    if (!mounted) return;
-    setState(() => _isPlaying = false);
-    try {
-      await _webController?.runJavaScript(
-          'window.__clearHighlights && window.__clearHighlights();');
-    } catch (_) {}
-  }
-
-  Future<void> _togglePlayback() async {
-    if (!_audioReady || _service == null) {
-      debugPrint('Audio jeszcze nie gotowe');
-      return;
-    }
-
-    // Jeśli gra — PANIC
-    if (_isPlaying) {
-      await _panic();
-      return;
-    }
-
-    try {
-      // PANIC przed startem nowego — wycisz wszystkie stare
-      await AudioSingleton.panic();
-
-      final midiBytes = await _service!.renderToMidiBytes();
-      if (midiBytes.isEmpty) {
-        debugPrint('Verovio nie zwróciło MIDI');
-        return;
-      }
-
-      final modified = _applyInstrumentToMidi(midiBytes, _selectedInstrument);
-
-      final tempDir = await getTemporaryDirectory();
-      final midiFile = File(
-        '${tempDir.path}/current_${DateTime.now().millisecondsSinceEpoch}.mid',
-      );
-      await midiFile.writeAsBytes(modified);
-
-      // Utwórz NOWĄ instancję sequencera
-      _sequencer = await AudioSingleton.recreate();
-
-      if (!mounted) return;
-      setState(() => _isPlaying = true);
-      AudioSingleton.markPlaying();
-      _toggleBar();
-
-      await _sequencer!.setSpeed(_tempoBpm / 120.0);
-      debugPrint('Wywołuję play() z pliku: ${midiFile.path}');
-      await _sequencer!.play(midiPath: midiFile.path);
-      debugPrint('play() zakończone');
-
-      // Monitor końca utworu (co 500 ms)
-      _playbackMonitor?.cancel();
-      _playbackMonitor = Timer.periodic(
-        const Duration(milliseconds: 500),
-        (timer) async {
-          if (!mounted) {
-            timer.cancel();
-            return;
-          }
-          if (_sequencer!.endOfSequence) {
-            timer.cancel();
-            _playbackMonitor = null;
-            _highlightTimer?.cancel();
-            _highlightTimer = null;
-            debugPrint('Koniec utworu');
-            AudioSingleton.markStopped();
-            if (!mounted) return;
-            setState(() => _isPlaying = false);
-            try {
-              await _webController?.runJavaScript(
-                  'window.__clearHighlights && window.__clearHighlights();');
-            } catch (_) {}
-          }
-        },
-      );
-
-      // Podświetlanie nut (co 80 ms) — z obsługą repetycji (-rend)
-      _highlightTimer?.cancel();
-      _highlightTimer = Timer.periodic(
-        const Duration(milliseconds: 80),
-        (timer) async {
-          if (!mounted || !_isPlaying) {
-            timer.cancel();
-            return;
-          }
-          try {
-            final posSeconds = _sequencer!.position;
-            final posMs = (posSeconds * 1000).round();
-            final jsonStr = await _service!.getElementsAtTime(posMs);
-            debugPrint('ELEMENTS [$posMs]: $jsonStr');
-            if (jsonStr.isEmpty) return;
-
-            final data = jsonDecode(jsonStr) as Map<String, dynamic>;
-            final notes = (data['notes'] as List?) ?? [];
-            final rests = (data['rests'] as List?) ?? [];
-            final chords = (data['chords'] as List?) ?? [];
-
-            final allIds = <String>[
-              ...notes.map((e) => _stripRend(e.toString())),
-              ...rests.map((e) => _stripRend(e.toString())),
-              ...chords.map((e) => _stripRend(e.toString())),
-            ];
-            if (allIds.isEmpty) return;
-
-            final jsIds = allIds.map((e) => '"$e"').join(',');
-            final js =
-                'window.__highlightNotes && window.__highlightNotes([$jsIds]);';
-            await _webController!.runJavaScript(js);
-          } catch (_) {}
-        },
-      );
-    } catch (e) {
-      debugPrint('Błąd odtwarzania: $e');
-      await _panic();
-    }
-  }
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Stack(
         children: [
           Positioned.fill(
-            child: _webController == null
-                ? const Center(child: CircularProgressIndicator())
-                : WebViewWidget(controller: _webController!),
+            child: _isImage
+                ? PhotoView(
+                    key: ValueKey('img_$_currentPath'),
+                    imageProvider: FileImage(File(_currentPath)),
+                    minScale: PhotoViewComputedScale.contained,
+                    maxScale: PhotoViewComputedScale.covered * 3.0,
+                    initialScale: PhotoViewComputedScale.contained,
+                    backgroundDecoration:
+                        const BoxDecoration(color: Colors.black),
+                  )
+                : _webController == null
+                    ? const Center(child: CircularProgressIndicator())
+                    : WebViewWidget(controller: _webController!),
           ),
           Positioned.fill(
             child: GestureDetector(
@@ -618,44 +695,33 @@ class _VerovioScreenState extends State<VerovioScreen> {
               onTap: _toggleBar,
             ),
           ),
-          // ── GÓRNY PASEK ───────────────────────────────────────
           AnimatedPositioned(
             duration: const Duration(milliseconds: 250),
             curve: Curves.easeOut,
-            top: _barVisible ? 0 : -80,
+            top: _barVisible ? 0 : -100,
             left: 0,
             right: 0,
             child: SafeArea(
               bottom: false,
               child: Container(
                 padding:
-                    const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-                color: Colors.black.withValues(alpha: 0.82),
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 8),
+                color: Colors.black.withValues(alpha: 0.72),
                 child: Row(
                   children: [
-                    _iconBtn(
-                      icon: Icons.arrow_back,
-                      onPressed: () async {
-                        await _panic();
-                        _hideTimer?.cancel();
-                        if (!mounted) return;
-                        Navigator.pop(context);
-                      },
-                      tooltip: 'Wróć',
-                    ),
                     if (_hasNavigation)
                       Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 2),
+                        padding: const EdgeInsets.symmetric(horizontal: 4),
                         child: Text(
                           '${_currentIndex + 1}/${_navList.length}',
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 11,
+                            fontSize: 16,
                             fontWeight: FontWeight.w600,
                           ),
                         ),
                       ),
-                    const SizedBox(width: 2),
+                    const SizedBox(width: 4),
                     _miniLabel('Z'),
                     _tinyBtn(
                       icon: Icons.remove,
@@ -666,7 +732,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
                       icon: Icons.add,
                       onPressed: () => _changeZoom(5),
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 6),
                     _miniLabel('W'),
                     _tinyBtn(
                       icon: Icons.remove,
@@ -679,13 +745,13 @@ class _VerovioScreenState extends State<VerovioScreen> {
                       icon: Icons.add,
                       onPressed: () => _changeSpacing(1),
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 6),
                     _compactToggle(
                       label: _viewLabels[_viewMode] ?? 'N',
                       active: _viewMode == 'both',
                       onPressed: _cycleViewMode,
                     ),
-                    const SizedBox(width: 4),
+                    const SizedBox(width: 6),
                     _compactDropdown<String>(
                       value: _transposeValue,
                       items: _keyLabels.entries
@@ -698,76 +764,109 @@ class _VerovioScreenState extends State<VerovioScreen> {
                         if (v != null) _changeTranspose(v);
                       },
                     ),
-                    const SizedBox(width: 4),
-                    _compactDropdown<int>(
-                      value: _selectedInstrument,
-                      items: _instruments.entries
-                          .map((e) => DropdownMenuItem<int>(
+                    const SizedBox(width: 6),
+                    _miniLabel('Okt'),
+                    _octaveBtn(
+                      icon: Icons.keyboard_arrow_down,
+                      active: _octaveShift == -1,
+                      onPressed: () => _changeOctave(-1),
+                      tooltip: 'Oktawa w dół',
+                    ),
+                    _octaveBox(),
+                    _octaveBtn(
+                      icon: Icons.keyboard_arrow_up,
+                      active: _octaveShift == 1,
+                      onPressed: () => _changeOctave(1),
+                      tooltip: 'Oktawa w górę',
+                    ),
+                    const SizedBox(width: 6),
+                    _compactDropdown<String>(
+                      value: _selectedFont,
+                      items: _fontLabels.entries
+                          .map((e) => DropdownMenuItem<String>(
                                 value: e.key,
                                 child: Text(e.value),
                               ))
                           .toList(),
                       onChanged: (v) {
-                        if (v != null) _changeInstrument(v);
+                        if (v != null) _changeFont(v);
                       },
                     ),
-                    const SizedBox(width: 4),
-                    GestureDetector(
-                      onTap: () => _showTempoDialog(),
-                      child: Container(
-                        height: 26,
-                        padding: const EdgeInsets.symmetric(horizontal: 5),
-                        alignment: Alignment.center,
-                        decoration: BoxDecoration(
-                          color: Colors.white12,
-                          borderRadius: BorderRadius.circular(3),
-                          border: Border.all(color: Colors.white24),
-                        ),
-                        child: Text(
-                          '$_tempoBpm',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 11,
-                            fontWeight: FontWeight.w700,
+                    const SizedBox(width: 6),
+                    _audioBtn(),
+                    const SizedBox(width: 6),
+                   IconButton(
+  icon: const Text(
+    'A',
+    style: TextStyle(
+      color: Colors.white,
+      fontSize: 22,
+      fontWeight: FontWeight.bold,
+    ),
+  ),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                          minWidth: 40, minHeight: 34),
+                      onPressed: () {
+                        _hideTimer?.cancel();
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) =>
+                                ChordsScreen(filePath: _currentPath),
                           ),
-                        ),
+                        );
+                      },
+                      tooltip: 'Akordy',
+                    ),
+                    const Spacer(),
+                    IconButton(
+                      icon: const Icon(
+                        Icons.more_vert,
+                        color: Colors.white,
+                        size: 28,
                       ),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                          minWidth: 52, minHeight: 52),
+                      onPressed: _showMainMenu,
+                      tooltip: 'Menu',
                     ),
-                    const SizedBox(width: 2),
-                    // ── PANIC (STOP) ─────────────────────────────
-                    _iconBtn(
-                      icon: Icons.stop,
-                      onPressed:
-                          (_audioReady && _isPlaying) ? _panic : null,
-                      tooltip: 'Stop (Panic)',
-                      enabled: _audioReady && _isPlaying,
-                    ),
-                    // ── PLAY / PAUZA ────────────────────────────
-                    _iconBtn(
-                      icon: _isPlaying ? Icons.pause : Icons.play_arrow,
-                      onPressed: _audioReady ? _togglePlayback : null,
-                      tooltip: _isPlaying ? 'Pauza' : 'Odtwórz',
-                      enabled: _audioReady,
+                    IconButton(
+                      icon: const Icon(
+                        Icons.arrow_back,
+                        color: Colors.white,
+                        size: 44,
+                      ),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(
+                          minWidth: 72, minHeight: 72),
+                      onPressed: () async {
+                        await _stopAudio();
+                        _hideTimer?.cancel();
+                        if (!mounted) return;
+                        Navigator.pop(context);
+                      },
+                      tooltip: 'Wróć do listy',
                     ),
                   ],
                 ),
               ),
             ),
           ),
-          // ── DOLNY PASEK NAWIGACJI ──────────────────────────────
           if (_hasNavigation)
             AnimatedPositioned(
               duration: const Duration(milliseconds: 250),
               curve: Curves.easeOut,
-              bottom: _barVisible ? 0 : -80,
+              bottom: _barVisible ? 0 : -100,
               left: 0,
               right: 0,
               child: SafeArea(
                 top: false,
                 child: Container(
                   padding:
-                      const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
-                  color: Colors.black.withValues(alpha: 0.82),
+                      const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                  color: Colors.black.withValues(alpha: 0.72),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -777,25 +876,21 @@ class _VerovioScreenState extends State<VerovioScreen> {
                           color: _currentIndex > 0
                               ? Colors.white
                               : Colors.white30,
-                          size: 22,
+                          size: 28,
                         ),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 40, minHeight: 40),
+                            const BoxConstraints(minWidth: 52, minHeight: 52),
                         onPressed:
                             _currentIndex > 0 ? () => _navigate(-1) : null,
                         tooltip: 'Poprzedni',
                       ),
                       Expanded(
                         child: Text(
-                          _fileKey.replaceAll(
-                            RegExp(r'\.(xml|mxl|musicxml|mei)$',
-                                caseSensitive: false),
-                            '',
-                          ),
+                          _cleanTitle,
                           style: const TextStyle(
                             color: Colors.white,
-                            fontSize: 12,
+                            fontSize: 22,
                             fontWeight: FontWeight.w600,
                           ),
                           textAlign: TextAlign.center,
@@ -808,11 +903,11 @@ class _VerovioScreenState extends State<VerovioScreen> {
                           color: _currentIndex < _navList.length - 1
                               ? Colors.white
                               : Colors.white30,
-                          size: 22,
+                          size: 28,
                         ),
                         padding: EdgeInsets.zero,
                         constraints:
-                            const BoxConstraints(minWidth: 40, minHeight: 40),
+                            const BoxConstraints(minWidth: 52, minHeight: 52),
                         onPressed: _currentIndex < _navList.length - 1
                             ? () => _navigate(1)
                             : null,
@@ -828,138 +923,213 @@ class _VerovioScreenState extends State<VerovioScreen> {
     );
   }
 
-  Future<void> _showTempoDialog() async {
+  Future<void> _showMainMenu() async {
     _hideTimer?.cancel();
-    int localTempo = _tempoBpm;
-    await showDialog(
+    final action = await showModalBottomSheet<String>(
       context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          backgroundColor: const Color(0xFF132845),
-          title: const Text(
-            'Tempo',
-            style: TextStyle(color: Colors.white),
-          ),
-          content: Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(
-                icon: const Icon(Icons.remove, color: Colors.white),
-                onPressed: () {
-                  setDialogState(() {
-                    localTempo = (localTempo - 5).clamp(40, 240);
-                  });
-                },
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.folder_open),
+              title: const Text('Wybierz folder audio (MP3)'),
+              subtitle: Text(
+                _audioFolderUri == null
+                    ? 'Nie wybrano folderu'
+                    : 'Folder ustawiony',
+                style: const TextStyle(fontSize: 12),
               ),
-              Container(
-                width: 80,
-                alignment: Alignment.center,
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.white12,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  '$localTempo',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.add, color: Colors.white),
-                onPressed: () {
-                  setDialogState(() {
-                    localTempo = (localTempo + 5).clamp(40, 240);
-                  });
-                },
-              ),
-            ],
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Anuluj',
-                  style: TextStyle(color: Colors.white70)),
+              onTap: () => Navigator.pop(ctx, 'audio_folder'),
             ),
-            TextButton(
-              onPressed: () async {
-                Navigator.pop(ctx);
-                final delta = localTempo - _tempoBpm;
-                await _changeTempo(delta);
-              },
-              child: const Text('OK',
-                  style: TextStyle(color: Color(0xFFd6ad23))),
-            ),
+            if (_audioFolderUri != null)
+              ListTile(
+                leading: const Icon(Icons.cleaning_services),
+                title: const Text('Wyczyść folder audio'),
+                onTap: () => Navigator.pop(ctx, 'clear_audio_folder'),
+              ),
           ],
         ),
       ),
     );
-    _scheduleHide();
+
+    if (!mounted) return;
+    if (action == 'audio_folder') {
+      await _pickAudioFolder();
+    } else if (action == 'clear_audio_folder') {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_prefsAudioFolder);
+      if (!mounted) return;
+      setState(() {
+        _audioFolderUri = null;
+        _audioUri = null;
+        _audioPlaying = false;
+        _audioPaused = false;
+      });
+      await _renderCurrentFile();
+    }
   }
 
-  // ── MAŁE KOMPONENTY PASKA ─────────────────────────────────────
-
   Widget _miniLabel(String text) => Padding(
-        padding: const EdgeInsets.only(right: 2, left: 2),
+        padding: const EdgeInsets.only(right: 3, left: 3),
         child: Text(text,
             style: const TextStyle(
                 color: Colors.white70,
-                fontSize: 10,
+                fontSize: 13,
                 fontWeight: FontWeight.w600)),
       );
 
   Widget _tinyBox(String text) => Container(
-        constraints: const BoxConstraints(minWidth: 26),
+        constraints: const BoxConstraints(minWidth: 34),
         alignment: Alignment.center,
-        margin: const EdgeInsets.symmetric(horizontal: 1),
-        padding: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+        margin: const EdgeInsets.symmetric(horizontal: 2),
+        padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 4),
         decoration: BoxDecoration(
           color: Colors.white12,
-          borderRadius: BorderRadius.circular(3),
+          borderRadius: BorderRadius.circular(4),
         ),
         child: Text(text,
             style: const TextStyle(
                 color: Colors.white,
-                fontSize: 10,
+                fontSize: 13,
                 fontWeight: FontWeight.w600)),
       );
 
   Widget _tinyBtn({required IconData icon, VoidCallback? onPressed}) =>
       SizedBox(
-        width: 24,
-        height: 24,
+        width: 32,
+        height: 32,
         child: IconButton(
-          icon: Icon(icon, color: Colors.white, size: 14),
+          icon: Icon(icon, color: Colors.white, size: 20),
           padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+          constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
           onPressed: onPressed,
         ),
       );
 
-  Widget _iconBtn({
+  Widget _octaveBtn({
     required IconData icon,
-    VoidCallback? onPressed,
+    required bool active,
+    required VoidCallback onPressed,
     required String tooltip,
-    bool enabled = true,
   }) =>
       SizedBox(
-        width: 30,
-        height: 30,
-        child: IconButton(
-          icon: Icon(
-            icon,
-            color: enabled ? Colors.white : Colors.white38,
-            size: 20,
+        width: 32,
+        height: 32,
+        child: Container(
+          decoration: BoxDecoration(
+            color: active ? const Color(0xFFd6ad23) : Colors.white12,
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(
+              color: active ? const Color(0xFFffe889) : Colors.white24,
+            ),
           ),
-          padding: EdgeInsets.zero,
-          constraints: const BoxConstraints(minWidth: 30, minHeight: 30),
-          onPressed: onPressed,
-          tooltip: tooltip,
+          child: IconButton(
+            icon: Icon(
+              icon,
+              color: active ? Colors.black : Colors.white,
+              size: 20,
+            ),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+            onPressed: onPressed,
+            tooltip: tooltip,
+          ),
         ),
       );
+
+  Widget _octaveBox() {
+    final label = _octaveShift == 0
+        ? '0'
+        : (_octaveShift > 0 ? '+8' : '−8');
+    final active = _octaveShift != 0;
+
+    return Container(
+      constraints: const BoxConstraints(minWidth: 34),
+      alignment: Alignment.center,
+      margin: const EdgeInsets.symmetric(horizontal: 2),
+      padding: const EdgeInsets.symmetric(vertical: 3, horizontal: 4),
+      decoration: BoxDecoration(
+        color: active ? const Color(0xFFffe889) : Colors.white12,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          color: active ? Colors.black : Colors.white,
+          fontSize: 13,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+
+  Widget _audioBtn() {
+    final hasAudio = _audioUri != null;
+    final playing = _audioPlaying;
+    final paused = _audioPaused;
+
+    if (!hasAudio) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 2),
+        child: Container(
+          height: 34,
+          padding: const EdgeInsets.symmetric(horizontal: 10),
+          alignment: Alignment.center,
+          decoration: BoxDecoration(
+            color: Colors.white12,
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: Colors.white24),
+          ),
+          child: const Text(
+            'BRAK MP3',
+            style: TextStyle(
+              color: Colors.white38,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      );
+    }
+
+    IconData icon;
+    String tooltip;
+
+    if (playing) {
+      icon = Icons.stop;
+      tooltip = 'Stop i na początek (2× klik → pauza)';
+    } else if (paused) {
+      icon = Icons.play_circle_filled;
+      tooltip = 'Wznów od miejsca pauzy';
+    } else {
+      icon = Icons.play_arrow;
+      tooltip = 'Graj MP3';
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: SizedBox(
+        width: 40,
+        height: 34,
+        child: Container(
+          decoration: BoxDecoration(
+            color: const Color(0xFFd6ad23),
+            borderRadius: BorderRadius.circular(4),
+            border: Border.all(color: const Color(0xFFFFE889)),
+          ),
+          child: IconButton(
+            icon: Icon(icon, color: Colors.black, size: 22),
+            padding: EdgeInsets.zero,
+            constraints: const BoxConstraints(minWidth: 40, minHeight: 34),
+            onPressed: _onAudioPressed,
+            tooltip: tooltip,
+          ),
+        ),
+      ),
+    );
+  }
 
   Widget _compactToggle({
     required String label,
@@ -969,12 +1139,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
       GestureDetector(
         onTap: onPressed,
         child: Container(
-          width: 32,
-          height: 26,
+          width: 42,
+          height: 34,
           alignment: Alignment.center,
           decoration: BoxDecoration(
             color: active ? const Color(0xFFd6ad23) : Colors.white12,
-            borderRadius: BorderRadius.circular(3),
+            borderRadius: BorderRadius.circular(4),
             border: Border.all(
               color: active ? const Color(0xFFffe889) : Colors.white24,
             ),
@@ -983,7 +1153,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
             label,
             style: TextStyle(
               color: active ? Colors.black : Colors.white,
-              fontSize: 11,
+              fontSize: 14,
               fontWeight: FontWeight.w700,
             ),
           ),
@@ -996,20 +1166,20 @@ class _VerovioScreenState extends State<VerovioScreen> {
     required void Function(T?) onChanged,
   }) =>
       Container(
-        height: 26,
-        padding: const EdgeInsets.symmetric(horizontal: 3),
+        height: 34,
+        padding: const EdgeInsets.symmetric(horizontal: 5),
         decoration: BoxDecoration(
           color: Colors.white12,
-          borderRadius: BorderRadius.circular(3),
+          borderRadius: BorderRadius.circular(4),
           border: Border.all(color: Colors.white24),
         ),
         child: DropdownButtonHideUnderline(
           child: DropdownButton<T>(
             value: value,
             dropdownColor: Colors.black87,
-            style: const TextStyle(color: Colors.white, fontSize: 11),
+            style: const TextStyle(color: Colors.white, fontSize: 14),
             icon: const Icon(Icons.arrow_drop_down,
-                color: Colors.white, size: 14),
+                color: Colors.white, size: 18),
             isDense: true,
             items: items,
             onChanged: onChanged,

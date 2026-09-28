@@ -2,15 +2,14 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
-import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'verovio_screen.dart';
-import 'package:rush_synth/rush_synth.dart';
+import 'services/pref_service.dart';
+import 'package:saf/saf.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await RushSynthLib.init();
   runApp(const MyApp());
 }
 
@@ -55,6 +54,12 @@ class FileListScreen extends StatefulWidget {
 
 class _FileListScreenState extends State<FileListScreen>
     with WidgetsBindingObserver {
+  // ===== BANKI =====
+  List<String> _banks = [];
+  Map<String, String> _bankUris = {};
+  String _activeBank = 'bank1';
+  final Saf _saf = Saf();
+
   List<File> _files = [];
   List<File> _filteredFiles = [];
   List<Playlist> _playlists = [];
@@ -73,7 +78,6 @@ class _FileListScreenState extends State<FileListScreen>
   bool _searchOpen = false;
 
   static const _playedAllKey = 'all';
-  static const _prefsNutyFolder = 'nuty_folder_path';
 
   @override
   void initState() {
@@ -102,7 +106,7 @@ class _FileListScreenState extends State<FileListScreen>
 
   Future<Directory> _getNutyDir() async {
     final docs = await getApplicationDocumentsDirectory();
-    final dir = Directory('${docs.path}/Nuty');
+    final dir = Directory('${docs.path}/Nuty/$_activeBank');
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
@@ -141,15 +145,21 @@ class _FileListScreenState extends State<FileListScreen>
   }
 
   Future<void> _init() async {
+    // Ładuj banki + URI + aktywny bank
+    await PrefService.migrateIfNeeded();
+    _banks = await PrefService.loadBanks();
+    _bankUris = await PrefService.loadBankUris();
+    _activeBank = await PrefService.loadActiveBank();
+    if (!_banks.contains(_activeBank) && _banks.isNotEmpty) {
+      _activeBank = _banks.first;
+    }
+
     await _loadPlaylists();
     await _loadPlayed();
     await _copyAssetsIfNeeded();
 
-    final prefs = await SharedPreferences.getInstance();
-    final savedPath = prefs.getString(_prefsNutyFolder);
     final dir = await _getNutyDir();
-    final folder = savedPath != null ? Directory(savedPath) : dir;
-    await _scanFolder(folder);
+    await _scanFolder(dir);
   }
 
   Future<void> _loadPlaylists() async {
@@ -194,27 +204,9 @@ class _FileListScreenState extends State<FileListScreen>
     await prefs.setString('played', raw);
   }
 
+  /// Import plików z Dysku Google (SAF) — wybór folderu, nie plików.
   Future<void> _pickFolder() async {
-    final result = await FilePicker.pickFiles(
-      type: FileType.any,
-    );
-
-    if (result.isEmpty) return;
-
-    final dir = await _getNutyDir();
-
-    for (final file in result) {
-      if (file.path == null) continue;
-      try {
-        final bytes = await File(file.path!).readAsBytes();
-        final outFile = File('${dir.path}/${file.name}');
-        await outFile.writeAsBytes(bytes);
-      } catch (e) {
-        debugPrint('Nie udało się skopiować ${file.name}: $e');
-      }
-    }
-
-    await _scanFolder(dir);
+    await _setBankUri(_activeBank);
   }
 
   Future<void> _scanFolder(Directory dir) async {
@@ -238,16 +230,23 @@ class _FileListScreenState extends State<FileListScreen>
         return name.endsWith('.xml') ||
             name.endsWith('.mxl') ||
             name.endsWith('.musicxml') ||
-            name.endsWith('.mei');
+            name.endsWith('.mei') ||
+            name.endsWith('.png') ||
+            name.endsWith('.jpg') ||
+            name.endsWith('.jpeg') ||
+            name.endsWith('.webp');
       }).toList();
 
       musicFiles.sort((a, b) {
         final aName = a.path.split('/').last;
         final bName = b.path.split('/').last;
-        final aNum = int.tryParse(aName.split('_').first) ?? 9999;
-        final bNum = int.tryParse(bName.split('_').first) ?? 9999;
+        // Wyciągnij numer z początku nazwy (obsługuje `_`, spację, kropkę)
+        final aMatch = RegExp(r'^(\d+)').firstMatch(aName);
+        final bMatch = RegExp(r'^(\d+)').firstMatch(bName);
+        final aNum = aMatch != null ? int.tryParse(aMatch.group(1)!) ?? 9999 : 9999;
+        final bNum = bMatch != null ? int.tryParse(bMatch.group(1)!) ?? 9999 : 9999;
         if (aNum != bNum) return aNum.compareTo(bNum);
-        return aName.compareTo(bName);
+        return aName.toLowerCase().compareTo(bName.toLowerCase());
       });
 
       setState(() {
@@ -338,6 +337,68 @@ class _FileListScreenState extends State<FileListScreen>
     );
 
     if (mounted) setState(() {});
+  }
+
+  Future<void> _deleteFile(File file) async {
+    final fileName = file.path.split('/').last;
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Usunąć plik?'),
+        content: Text('Plik "$fileName" zostanie trwale usunięty.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Anuluj'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text(
+              'Usuń',
+              style: TextStyle(color: Colors.red),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    try {
+      if (await file.exists()) {
+        await file.delete();
+        debugPrint('Usunięto plik: $fileName');
+      }
+
+      setState(() {
+        _playlists = _playlists
+            .map((p) => Playlist(
+                  id: p.id,
+                  name: p.name,
+                  fileNames: p.fileNames.where((n) => n != fileName).toList(),
+                ))
+            .toList();
+        _playedByPlaylist = _playedByPlaylist.map(
+          (k, v) => MapEntry(k, v.where((n) => n != fileName).toList()),
+        );
+      });
+      await _savePlaylists();
+      await _savePlayed();
+
+      if (!mounted) return;
+      final dir = await _getNutyDir();
+      await _scanFolder(dir);
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Usunięto: $fileName')),
+      );
+    } catch (e) {
+      debugPrint('Błąd usuwania: $e');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Nie udało się usunąć: $e')),
+      );
+    }
   }
 
   void _startNewPlaylist() {
@@ -598,22 +659,69 @@ class _FileListScreenState extends State<FileListScreen>
         child: _loading
             ? Center(child: Text(_status))
             : _files.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(_status),
-                        const SizedBox(height: 16),
-                        ElevatedButton(
-                          onPressed: _pickFolder,
-                          child: const Text('Wybierz folder'),
+                ? Column(
+                    children: [
+                      _buildTopBar(activePlaylist),
+                      _buildBankBar(),
+                      Expanded(
+                        child: Center(
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                _bankUris[_activeBank] == null
+                                    ? Icons.folder_open
+                                    : Icons.cloud_done,
+                                size: 64,
+                                color: _bankUris[_activeBank] == null
+                                    ? Colors.grey
+                                    : Colors.green,
+                              ),
+                              const SizedBox(height: 16),
+                              Text(
+                                'Bank "$_activeBank" jest pusty',
+                                style: const TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              Padding(
+                                padding:
+                                    const EdgeInsets.symmetric(horizontal: 32),
+                                child: Text(
+                                  _bankUris[_activeBank] == null
+                                      ? 'Wskaż folder z Dysku Google, żeby zaimportować nuty'
+                                      : 'Kliknij „Odśwież z Dysku Google", żeby pobrać nowe pliki',
+                                  style: const TextStyle(
+                                      fontSize: 14, color: Colors.grey),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                              const SizedBox(height: 24),
+                              if (_bankUris[_activeBank] == null)
+                                ElevatedButton.icon(
+                                  onPressed: _pickFolder,
+                                  icon: const Icon(Icons.folder_open),
+                                  label: const Text('Wskaż folder źródłowy'),
+                                )
+                              else
+                                ElevatedButton.icon(
+                                  onPressed: () =>
+                                      _refreshFromBankUri(_activeBank),
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text('Odśwież z Dysku Google'),
+                                ),
+                            ],
+                          ),
                         ),
-                      ],
-                    ),
+                      ),
+                    ],
                   )
                 : Column(
                     children: [
                       _buildTopBar(activePlaylist),
+                      _buildBankBar(),
                       if (_searchOpen)
                         Padding(
                           padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
@@ -640,17 +748,22 @@ class _FileListScreenState extends State<FileListScreen>
                       Expanded(
                         child: LayoutBuilder(
                           builder: (context, constraints) {
-                            final isLandscape =
-                                constraints.maxWidth > constraints.maxHeight;
-                            final cols = isLandscape ? 4 : 2;
+                            const cols = 4;
+                            const minRowsVisible = 8;
+
+                            final tileW = constraints.maxWidth / cols;
+                            final tileH =
+                                constraints.maxHeight / minRowsVisible;
+                            final aspect = tileW / tileH;
+
                             return GridView.builder(
-                              padding: const EdgeInsets.all(8),
+                              padding: const EdgeInsets.all(6),
                               gridDelegate:
                                   SliverGridDelegateWithFixedCrossAxisCount(
                                 crossAxisCount: cols,
-                                crossAxisSpacing: 8,
-                                mainAxisSpacing: 8,
-                                childAspectRatio: 4.0,
+                                crossAxisSpacing: 6,
+                                mainAxisSpacing: 6,
+                                childAspectRatio: aspect,
                               ),
                               itemCount: _filteredFiles.length,
                               itemBuilder: (context, index) {
@@ -668,6 +781,7 @@ class _FileListScreenState extends State<FileListScreen>
                                       _openFile(file, index: index);
                                     }
                                   },
+                                  onLongPress: () => _deleteFile(file),
                                 );
                               },
                             );
@@ -681,6 +795,532 @@ class _FileListScreenState extends State<FileListScreen>
     );
   }
 
+  /// Poziomy pasek z bankami (chipsy) + przycisk dodania nowego.
+  /// Dialog: tworzy nowy bank (katalog) i przełącza na niego.
+  Future<void> _askForNewBank() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Nowy bank'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: 'np. szanty, kapela1, kapela inni',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Anuluj'),
+          ),
+          TextButton(
+            onPressed: () {
+              final n = ctrl.text.trim();
+              if (n.isEmpty) return;
+              Navigator.pop(ctx, n);
+            },
+            child: const Text('Utwórz'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty) return;
+
+    if (_banks.contains(name)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Bank "$name" już istnieje')),
+      );
+      await _switchBank(name);
+      return;
+    }
+
+    setState(() {
+      _banks.add(name);
+    });
+    await PrefService.saveBanks(_banks);
+
+    final docs = await getApplicationDocumentsDirectory();
+    final newDir = Directory('${docs.path}/Nuty/$name');
+    if (!await newDir.exists()) {
+      await newDir.create(recursive: true);
+    }
+
+    await _switchBank(name);
+  }
+
+  /// Menu banku po długim przytrzymaniu chipa.
+  Future<void> _showBankMenu(String bank) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Text(
+                'Bank: $bank',
+                style: const TextStyle(
+                    fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.swap_horiz),
+              title: const Text('Przełącz na ten bank'),
+              onTap: () => Navigator.pop(ctx, 'switch'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.edit),
+              title: const Text('Zmień nazwę'),
+              onTap: () => Navigator.pop(ctx, 'rename'),
+            ),
+            const Divider(height: 1),
+            ListTile(
+              leading: Icon(
+                _bankUris[bank] == null
+                    ? Icons.folder_open
+                    : Icons.cloud_done,
+                color: _bankUris[bank] == null ? null : Colors.green,
+              ),
+              title: Text(
+                _bankUris[bank] == null
+                    ? 'Wskaż folder źródłowy (Dysk Google)'
+                    : 'Zmień folder źródłowy',
+              ),
+              onTap: () => Navigator.pop(ctx, 'set_uri'),
+            ),
+            if (_bankUris[bank] != null)
+              ListTile(
+                leading: const Icon(Icons.refresh),
+                title: const Text('Odśwież z Dysk Google'),
+                onTap: () => Navigator.pop(ctx, 'refresh'),
+              ),
+            if (_bankUris[bank] != null)
+              ListTile(
+                leading: const Icon(Icons.link_off),
+                title: const Text('Usuń folder źródłowy'),
+                onTap: () => Navigator.pop(ctx, 'clear_uri'),
+              ),
+            const Divider(height: 1),
+            ListTile(
+              leading: const Icon(Icons.delete, color: Colors.red),
+              title: const Text(
+                'Usuń bank',
+                style: TextStyle(color: Colors.red),
+              ),
+              onTap: () => Navigator.pop(ctx, 'delete'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (action == 'switch') {
+      await _switchBank(bank);
+    } else if (action == 'rename') {
+      await _renameBank(bank);
+    } else if (action == 'set_uri') {
+      await _setBankUri(bank);
+    } else if (action == 'refresh') {
+      await _refreshFromBankUri(bank);
+    } else if (action == 'clear_uri') {
+      await _clearBankUri(bank);
+    } else if (action == 'delete') {
+      await _deleteBank(bank);
+    }
+  }
+
+  /// Przełącza aktywny bank.
+  Future<void> _switchBank(String bank) async {
+    if (bank == _activeBank) return;
+    setState(() {
+      _activeBank = bank;
+      _activePlaylistId = null;
+      _searchController.clear();
+      _playlists = [];
+      _playedByPlaylist = {};
+      _files = [];
+      _filteredFiles = [];
+    });
+    await PrefService.saveActiveBank(bank);
+    await _loadPlaylists();
+    await _loadPlayed();
+    final dir = await _getNutyDir();
+    if (!await dir.exists()) {
+      await dir.create(recursive: true);
+    }
+    await _scanFolder(dir);
+  }
+
+  /// Usuwa bank.
+  Future<void> _deleteBank(String bank) async {
+    if (_banks.length <= 1) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Nie można usunąć ostatniego banku')),
+      );
+      return;
+    }
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Usunąć bank "$bank"?'),
+        content: const Text(
+            'Zostaną usunięte wszystkie pliki, playlisty i oznaczenia tego banku.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Anuluj'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Usuń', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final bankDir = Directory('${docs.path}/Nuty/$bank');
+      if (await bankDir.exists()) {
+        await bankDir.delete(recursive: true);
+      }
+    } catch (e) {
+      debugPrint('Błąd usuwania katalogu banku: $e');
+    }
+
+    setState(() {
+      _banks.remove(bank);
+    });
+    await PrefService.saveBanks(_banks);
+
+    _bankUris.remove(bank);
+    await PrefService.saveBankUris(_bankUris);
+
+    if (bank == _activeBank) {
+      await _switchBank(_banks.first);
+    }
+  }
+
+  /// Zmienia nazwę banku.
+  Future<void> _renameBank(String oldName) async {
+    final ctrl = TextEditingController(text: oldName);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Zmień nazwę banku'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Nowa nazwa'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Anuluj'),
+          ),
+          TextButton(
+            onPressed: () {
+              final n = ctrl.text.trim();
+              if (n.isEmpty) return;
+              Navigator.pop(ctx, n);
+            },
+            child: const Text('Zmień'),
+          ),
+        ],
+      ),
+    );
+    if (newName == null || newName.isEmpty) return;
+    if (newName == oldName) return;
+
+    if (_banks.contains(newName)) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Bank "$newName" już istnieje')),
+      );
+      return;
+    }
+
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final oldDir = Directory('${docs.path}/Nuty/$oldName');
+      final newDir = Directory('${docs.path}/Nuty/$newName');
+      if (await oldDir.exists() && !await newDir.exists()) {
+        await oldDir.rename(newDir.path);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Błąd zmiany katalogu: $e')),
+      );
+      return;
+    }
+
+    final uri = _bankUris[oldName];
+    if (uri != null) {
+      _bankUris.remove(oldName);
+      _bankUris[newName] = uri;
+      await PrefService.saveBankUris(_bankUris);
+    }
+
+    setState(() {
+      final idx = _banks.indexOf(oldName);
+      if (idx >= 0) _banks[idx] = newName;
+    });
+    await PrefService.saveBanks(_banks);
+
+    if (_activeBank == oldName) {
+      setState(() {
+        _activeBank = newName;
+      });
+      await PrefService.saveActiveBank(newName);
+      final dir = await _getNutyDir();
+      await _scanFolder(dir);
+    }
+  }
+
+  /// Wskazanie folderu źródłowego (Dysk Google) dla banku + auto-zmiana nazwy.
+  Future<void> _setBankUri(String bank) async {
+    debugPrint('SETBANK START: bank=$bank');
+    SafDocumentFile? dir;
+    try {
+      dir = await _saf.pickDirectory();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Błąd wyboru folderu: $e')),
+      );
+      return;
+    }
+    if (dir == null) {
+      debugPrint('SETBANK: user cancelled');
+      return;
+    }
+    debugPrint('SETBANK: dir.name="${dir.name}", dir.uri="${dir.uri}"');
+
+    final folderName = dir.name.trim();
+    final isDefaultName = RegExp(r'^bank\d+$').hasMatch(bank);
+    final shouldRename = folderName.isNotEmpty &&
+        isDefaultName &&
+        folderName != bank;
+
+    var effectiveBank = bank;
+
+    if (shouldRename) {
+      var newName = folderName;
+      var counter = 2;
+      while (_banks.contains(newName) && newName != bank) {
+        newName = '$folderName ($counter)';
+        counter++;
+      }
+
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        final oldDir = Directory('${docs.path}/Nuty/$bank');
+        final newDir = Directory('${docs.path}/Nuty/$newName');
+        if (await oldDir.exists() && !await newDir.exists()) {
+          await oldDir.rename(newDir.path);
+        }
+
+        _bankUris.remove(bank);
+        _bankUris[newName] = dir.uri;
+        await PrefService.saveBankUris(_bankUris);
+
+        setState(() {
+          final idx = _banks.indexOf(bank);
+          if (idx >= 0) _banks[idx] = newName;
+        });
+        await PrefService.saveBanks(_banks);
+
+        if (_activeBank == bank) {
+          setState(() {
+            _activeBank = newName;
+          });
+          await PrefService.saveActiveBank(newName);
+        }
+
+        effectiveBank = newName;
+        debugPrint('SETBANK Bank "$bank" -> "$newName"');
+      } catch (e) {
+        debugPrint('Błąd zmiany nazwy banku: $e');
+      }
+    } else {
+      _bankUris[bank] = dir.uri;
+      await PrefService.saveBankUri(bank, dir.uri);
+    }
+
+    _banks = await PrefService.loadBanks();
+    if (!mounted) return;
+    setState(() {});
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Wybrano folder dla "$effectiveBank" — kopiuję pliki...',
+        ),
+      ),
+    );
+
+    await _refreshFromBankUri(effectiveBank);
+  }
+
+  /// Kopiuje nowe pliki z folderu źródłowego.
+  Future<void> _refreshFromBankUri(String bank) async {
+    final uri = _bankUris[bank];
+    if (uri == null || uri.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Bank "$bank" nie ma wskazanego folderu')),
+      );
+      return;
+    }
+
+    List<SafDocumentFile> files;
+    try {
+      files = await _saf.list(uri);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Błąd listowania folderu: $e')),
+      );
+      return;
+    }
+
+    final docs = await getApplicationDocumentsDirectory();
+    final localDir = Directory('${docs.path}/Nuty/$bank');
+    if (!await localDir.exists()) {
+      await localDir.create(recursive: true);
+    }
+
+    var copied = 0;
+    var skipped = 0;
+    var errors = 0;
+
+    for (final f in files) {
+      if (f.isDir) continue;
+
+      final name = f.name.toLowerCase();
+      final isSupported = name.endsWith('.xml') ||
+          name.endsWith('.mxl') ||
+          name.endsWith('.musicxml') ||
+          name.endsWith('.mei') ||
+          name.endsWith('.png') ||
+          name.endsWith('.jpg') ||
+          name.endsWith('.jpeg') ||
+          name.endsWith('.webp');
+      if (!isSupported) continue;
+
+      final localFile = File('${localDir.path}/${f.name}');
+      if (await localFile.exists()) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        final bytes = await _saf.readFileBytes(f.uri);
+        await localFile.writeAsBytes(bytes);
+        copied++;
+      } catch (e) {
+        debugPrint('Błąd kopiowania ${f.name}: $e');
+        errors++;
+      }
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Skopiowano $copied nowych, pominięto $skipped istniejących'
+          '${errors > 0 ? ", błędy: $errors" : ""}',
+        ),
+      ),
+    );
+
+    if (bank == _activeBank) {
+      await _scanFolder(localDir);
+    }
+  }
+
+  /// Usuwa URI folderu źródłowego banku.
+  Future<void> _clearBankUri(String bank) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Usunąć folder źródłowy banku "$bank"?'),
+        content: const Text(
+            'Pliki lokalne zostaną. Usunięty zostanie tylko link do Dysku Google.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Anuluj'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Usuń link'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    _bankUris.remove(bank);
+    await PrefService.saveBankUri(bank, null);
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Usunięto link do folderu źródłowego "$bank"')),
+    );
+  }
+
+  /// Poziomy pasek z bankami (chipsy) + przycisk dodania nowego.
+  Widget _buildBankBar() {
+    return Container(
+      height: 44,
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      color: const Color(0xFF132845).withValues(alpha: 0.85),
+      child: ListView.builder(
+        key: ValueKey('bankbar_${_banks.join(",")}'),
+        scrollDirection: Axis.horizontal,
+        itemCount: _banks.length + 1,
+        itemBuilder: (context, index) {
+          // Ostatni element — przycisk "Nowy bank"
+          if (index == _banks.length) {
+            return Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: ActionChip(
+                avatar: const Icon(Icons.add, size: 16),
+                label: const Text('Nowy'),
+                onPressed: _askForNewBank,
+              ),
+            );
+          }
+          final bank = _banks[index];
+          final active = bank == _activeBank;
+          return Padding(
+            key: ValueKey('bank_$bank'),
+            padding: const EdgeInsets.only(right: 6),
+            child: GestureDetector(
+              onLongPress: () => _showBankMenu(bank),
+              child: ChoiceChip(
+                key: ValueKey('chip_$bank'),
+                label: Text(bank),
+                selected: active,
+                onSelected: (_) => _switchBank(bank),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
   Widget _buildTopBar(Playlist? activePlaylist) {
     return Container(
       height: 56,
@@ -688,14 +1328,7 @@ class _FileListScreenState extends State<FileListScreen>
       color: const Color(0xFF132845),
       child: Row(
         children: [
-          if (_activePlaylistId != null)
-            IconButton(
-              icon: const Icon(Icons.arrow_back, color: Colors.white, size: 22),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-              tooltip: 'Wróć',
-              onPressed: _closePlaylist,
-            ),
+          // LEWA STRONA: playlisty (chipy) albo nazwa aktywnej playlisty
           if (_activePlaylistId == null && _playlists.isNotEmpty)
             Expanded(
               child: ListView.builder(
@@ -740,6 +1373,8 @@ class _FileListScreenState extends State<FileListScreen>
                 ),
               ),
             ),
+
+          // licznik plików
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 6),
             child: Text(
@@ -747,6 +1382,8 @@ class _FileListScreenState extends State<FileListScreen>
               style: const TextStyle(color: Colors.white70, fontSize: 12),
             ),
           ),
+
+          // wyszukiwanie
           IconButton(
             icon: Icon(
               _searchOpen ? Icons.search_off : Icons.search,
@@ -758,6 +1395,8 @@ class _FileListScreenState extends State<FileListScreen>
             tooltip: 'Szukaj',
             onPressed: () => setState(() => _searchOpen = !_searchOpen),
           ),
+
+          // nowa playlista (tylko na ekranie głównym)
           if (!_buildMode && _activePlaylistId == null)
             IconButton(
               icon: const Icon(Icons.add, color: Colors.white, size: 22),
@@ -766,6 +1405,8 @@ class _FileListScreenState extends State<FileListScreen>
               tooltip: 'Nowa playlista',
               onPressed: _startNewPlaylist,
             ),
+
+          // edycja playlisty (tylko w widoku playlisty)
           if (_activePlaylistId != null && !_buildMode)
             IconButton(
               icon: const Icon(Icons.edit, color: Colors.white, size: 22),
@@ -778,6 +1419,8 @@ class _FileListScreenState extends State<FileListScreen>
                 _startEditPlaylist(pl);
               },
             ),
+
+          // czyść oznaczenia
           if (_hasPlayedInCurrent && !_buildMode)
             IconButton(
               icon: const Icon(Icons.cleaning_services,
@@ -787,13 +1430,22 @@ class _FileListScreenState extends State<FileListScreen>
               tooltip: 'Czyść listę',
               onPressed: _clearCurrentPlayed,
             ),
-          IconButton(
-            icon: const Icon(Icons.folder_open, color: Colors.white, size: 22),
-            padding: EdgeInsets.zero,
-            constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-            tooltip: 'Zmień folder',
-            onPressed: _pickFolder,
-          ),
+          if (_activePlaylistId != null)
+            IconButton(
+              icon: const Icon(Icons.arrow_back, color: Colors.white, size: 44),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 72, minHeight: 72),
+              tooltip: 'Wróć do listy plików',
+              onPressed: _closePlaylist,
+            ),
+          if (_activePlaylistId == null)
+            IconButton(
+              icon: const Icon(Icons.folder_open, color: Colors.white, size: 22),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+              tooltip: 'Zmień folder',
+              onPressed: _pickFolder,
+            ),
         ],
       ),
     );
@@ -845,6 +1497,7 @@ class _FileListScreenState extends State<FileListScreen>
 class _Tile extends StatelessWidget {
   final String fileName;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
   final bool buildMode;
   final int? orderNumber;
   final bool played;
@@ -852,6 +1505,7 @@ class _Tile extends StatelessWidget {
   const _Tile({
     required this.fileName,
     required this.onTap,
+    this.onLongPress,
     this.buildMode = false,
     this.orderNumber,
     this.played = false,
@@ -860,7 +1514,7 @@ class _Tile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final nameWithoutExt = fileName.replaceAll(
-      RegExp(r'\.(xml|mxl|musicxml|mei)$', caseSensitive: false),
+      RegExp(r'\.(xml|mxl|musicxml|mei|png|jpg|jpeg|webp)$', caseSensitive: false),
       '',
     );
 
@@ -873,8 +1527,8 @@ class _Tile extends StatelessWidget {
       title = parts.sublist(1).join(' ').replaceAll('_', ' ');
     }
 
-    if (title.length > 16) {
-      title = '${title.substring(0, 15)}…';
+    if (title.length > 20) {
+      title = '${title.substring(0, 19)}…';
     }
 
     final selected = orderNumber != null;
@@ -893,15 +1547,16 @@ class _Tile extends StatelessWidget {
       borderRadius: BorderRadius.circular(6),
       child: InkWell(
         onTap: onTap,
+        onLongPress: onLongPress,
         borderRadius: BorderRadius.circular(6),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           child: Row(
             children: [
               if (buildMode && selected)
                 Container(
-                  width: 28,
-                  height: 28,
+                  width: 40,
+                  height: 40,
                   alignment: Alignment.center,
                   decoration: const BoxDecoration(
                     color: Colors.black87,
@@ -910,7 +1565,7 @@ class _Tile extends StatelessWidget {
                   child: Text(
                     '$orderNumber',
                     style: const TextStyle(
-                      fontSize: 12,
+                      fontSize: 18,
                       fontWeight: FontWeight.bold,
                       color: Colors.white,
                     ),
@@ -918,8 +1573,8 @@ class _Tile extends StatelessWidget {
                 )
               else if (number.isNotEmpty)
                 Container(
-                  width: 28,
-                  height: 28,
+                  width: 40,
+                  height: 40,
                   alignment: Alignment.center,
                   decoration: const BoxDecoration(
                     color: Colors.white,
@@ -928,18 +1583,18 @@ class _Tile extends StatelessWidget {
                   child: Text(
                     number,
                     style: const TextStyle(
-                      fontSize: 12,
+                      fontSize: 18,
                       fontWeight: FontWeight.bold,
                       color: Colors.black,
                     ),
                   ),
                 ),
-              const SizedBox(width: 6),
+              const SizedBox(width: 10),
               Expanded(
                 child: Text(
                   title,
                   style: const TextStyle(
-                    fontSize: 13,
+                    fontSize: 28,
                     fontWeight: FontWeight.w600,
                     color: Colors.black,
                   ),
