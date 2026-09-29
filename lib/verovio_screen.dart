@@ -59,6 +59,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
   String _selectedFont = 'Leipzig';
 
   late List<String> _navList;
+  final FocusNode _keyboardFocus = FocusNode();
   late int _currentIndex;
   late String _currentPath;
 
@@ -135,6 +136,9 @@ class _VerovioScreenState extends State<VerovioScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _keyboardFocus.requestFocus();
+    });
     _currentPath = widget.filePath;
     _currentIndex = widget.currentIndex;
     _navList = widget.navigationList ?? [widget.filePath];
@@ -158,6 +162,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   @override
   void dispose() {
+    _keyboardFocus.dispose();
     _hideTimer?.cancel();
     _immersiveTimer?.cancel();
     // Przywróć paski systemowe przy wyjściu z ekranu
@@ -671,7 +676,24 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
+    return KeyboardListener(
+      focusNode: _keyboardFocus,
+      autofocus: true,
+      onKeyEvent: (event) {
+        if (event is KeyDownEvent) {
+          final k = event.logicalKey;
+          if (k == LogicalKeyboardKey.arrowLeft ||
+              k == LogicalKeyboardKey.pageUp) {
+            _navigate(-1);
+          } else if (k == LogicalKeyboardKey.arrowRight ||
+              k == LogicalKeyboardKey.pageDown) {
+            _navigate(1);
+          } else if (k == LogicalKeyboardKey.escape) {
+            Navigator.pop(context);
+          }
+        }
+      },
+      child: Scaffold(
       body: Stack(
         children: [
           Positioned.fill(
@@ -925,6 +947,7 @@ class _VerovioScreenState extends State<VerovioScreen> {
               ),
             ),
         ],
+      ),
       ),
     );
   }
