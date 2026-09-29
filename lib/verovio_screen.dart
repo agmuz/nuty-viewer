@@ -693,6 +693,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
             child: GestureDetector(
               behavior: HitTestBehavior.translucent,
               onTap: _toggleBar,
+              onDoubleTap: () async {
+                await _stopAudio();
+                _hideTimer?.cancel();
+                if (!mounted) return;
+                Navigator.pop(context);
+              },
             ),
           ),
           AnimatedPositioned(
