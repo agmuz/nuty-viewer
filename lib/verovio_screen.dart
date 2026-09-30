@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:dart_midi_pro/dart_midi_pro.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:rush_synth/rush_synth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -36,6 +37,14 @@ class _VerovioScreenState extends State<VerovioScreen> {
 
   bool _barVisible = true;
   Timer? _hideTimer;
+
+  // Obsługa tap/double-tap
+  DateTime? _lastTapTime;
+  DateTime? _pointerDownTime;
+  Offset? _pointerDownPosition;
+
+  // Ochrona przed wielokrotnym wywołaniem nawigacji (pedał BT)
+  bool _navigating = false;
 
   int _zoomValue = 70;
   int _spacingValue = 0;
@@ -98,10 +107,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
     _navList = widget.navigationList ?? [widget.filePath];
     _loadPrefsForCurrentFile().then((_) => _init());
     _scheduleHide();
+    HardwareKeyboard.instance.addHandler(_handleKeyEvent);
   }
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
     _hideTimer?.cancel();
     _playbackMonitor?.cancel();
     _highlightTimer?.cancel();
@@ -110,6 +121,41 @@ class _VerovioScreenState extends State<VerovioScreen> {
     // Fire and forget — wycisz wszystkie silniki
     AudioSingleton.panic();
     super.dispose();
+  }
+
+  // ── OBSŁUGA KLAWISZY (PEDAŁ BT) ───────────────────────────────
+  bool _handleKeyEvent(KeyEvent event) {
+    if (event is! KeyDownEvent) return false;
+
+    final key = event.logicalKey;
+
+    // Strzałki lewo/prawo → zmiana utworu (to samo co przyciski na dole)
+    if (key == LogicalKeyboardKey.arrowLeft) {
+      if (_currentIndex > 0) _navigate(-1);
+      return true;
+    }
+    if (key == LogicalKeyboardKey.arrowRight) {
+      if (_currentIndex < _navList.length - 1) _navigate(1);
+      return true;
+    }
+
+    // Esc → powrót do kafelków
+    if (key == LogicalKeyboardKey.escape) {
+      _handleDoubleTap();
+      return true;
+    }
+
+    return false;
+  }
+
+  // ── OBSŁUGA TAP / DOUBLE-TAP ──────────────────────────────────
+  Future<void> _handleDoubleTap() async {
+    _hideTimer?.cancel();
+    if (!mounted) return;
+    // Najpierw nawigacja (przed await), potem panic w tle
+    Navigator.pop(context);
+    // Fire and forget — panic w tle
+    _panic();
   }
 
   Future<void> _loadPrefsForCurrentFile() async {
@@ -241,21 +287,27 @@ class _VerovioScreenState extends State<VerovioScreen> {
   }
 
   Future<void> _navigate(int direction) async {
+    if (_navigating) return;
     final newIndex = _currentIndex + direction;
     if (newIndex < 0 || newIndex >= _navList.length) return;
 
-    await _panic();
-    await _savePrefsForCurrentFile();
+    _navigating = true;
+    try {
+      await _panic();
+      await _savePrefsForCurrentFile();
 
-    setState(() {
-      _currentIndex = newIndex;
-      _currentPath = _navList[newIndex];
-    });
+      setState(() {
+        _currentIndex = newIndex;
+        _currentPath = _navList[newIndex];
+      });
 
-    await widget.onFileChanged?.call(_currentPath);
+      await widget.onFileChanged?.call(_currentPath);
 
-    await _loadPrefsForCurrentFile();
-    await _renderCurrentFile();
+      await _loadPrefsForCurrentFile();
+      await _renderCurrentFile();
+    } finally {
+      _navigating = false;
+    }
   }
 
   String _svgHtmlWithSpacing(String svg) {
@@ -470,14 +522,11 @@ class _VerovioScreenState extends State<VerovioScreen> {
     }
   }
 
-  /// Usuwa sufiks "-rend" z ID nuty (Verovio dodaje go przy repetycji).
   String _stripRend(String id) {
     final idx = id.indexOf('-rend');
     return idx >= 0 ? id.substring(0, idx) : id;
   }
 
-  /// PANIC — wycisz wszystkie silniki audio i zatrzymaj timery.
-  /// To jest jedyny sposób, żeby uciszyć stare instancje (bo stop() blokuje iOS).
   Future<void> _panic() async {
     _playbackMonitor?.cancel();
     _playbackMonitor = null;
@@ -498,14 +547,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
       return;
     }
 
-    // Jeśli gra — PANIC
     if (_isPlaying) {
       await _panic();
       return;
     }
 
     try {
-      // PANIC przed startem nowego — wycisz wszystkie stare
       await AudioSingleton.panic();
 
       final midiBytes = await _service!.renderToMidiBytes();
@@ -522,7 +569,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
       );
       await midiFile.writeAsBytes(modified);
 
-      // Utwórz NOWĄ instancję sequencera
       _sequencer = await AudioSingleton.recreate();
 
       if (!mounted) return;
@@ -535,7 +581,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
       await _sequencer!.play(midiPath: midiFile.path);
       debugPrint('play() zakończone');
 
-      // Monitor końca utworu (co 500 ms)
       _playbackMonitor?.cancel();
       _playbackMonitor = Timer.periodic(
         const Duration(milliseconds: 500),
@@ -561,7 +606,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
         },
       );
 
-      // Podświetlanie nut (co 80 ms) — z obsługą repetycji (-rend)
       _highlightTimer?.cancel();
       _highlightTimer = Timer.periodic(
         const Duration(milliseconds: 80),
@@ -613,9 +657,35 @@ class _VerovioScreenState extends State<VerovioScreen> {
                 : WebViewWidget(controller: _webController!),
           ),
           Positioned.fill(
-            child: GestureDetector(
+            child: Listener(
               behavior: HitTestBehavior.translucent,
-              onTap: _toggleBar,
+              onPointerDown: (event) {
+                _pointerDownTime = DateTime.now();
+                _pointerDownPosition = event.position;
+              },
+              onPointerUp: (event) {
+                if (_pointerDownTime == null || _pointerDownPosition == null) {
+                  return;
+                }
+                final now = DateTime.now();
+                final duration = now.difference(_pointerDownTime!);
+                final distance =
+                    (event.position - _pointerDownPosition!).distance;
+
+                // Tap = krótko (<300 ms) i bez ruchu (<10 px)
+                if (duration.inMilliseconds < 300 && distance < 10) {
+                  if (_lastTapTime != null &&
+                      now.difference(_lastTapTime!).inMilliseconds < 300) {
+                    // DOUBLE-TAP → powrót do kafelków
+                    _lastTapTime = null;
+                    _handleDoubleTap();
+                  } else {
+                    // SINGLE-TAP → pokaż paski
+                    _lastTapTime = now;
+                    _toggleBar();
+                  }
+                }
+              },
             ),
           ),
           // ── GÓRNY PASEK ───────────────────────────────────────
@@ -635,11 +705,12 @@ class _VerovioScreenState extends State<VerovioScreen> {
                   children: [
                     _iconBtn(
                       icon: Icons.arrow_back,
-                      onPressed: () async {
-                        await _panic();
+                      onPressed: () {
                         _hideTimer?.cancel();
                         if (!mounted) return;
                         Navigator.pop(context);
+                        // Fire and forget — panic w tle
+                        _panic();
                       },
                       tooltip: 'Wróć',
                     ),
@@ -734,7 +805,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
                       ),
                     ),
                     const SizedBox(width: 2),
-                    // ── PANIC (STOP) ─────────────────────────────
                     _iconBtn(
                       icon: Icons.stop,
                       onPressed:
@@ -742,7 +812,6 @@ class _VerovioScreenState extends State<VerovioScreen> {
                       tooltip: 'Stop (Panic)',
                       enabled: _audioReady && _isPlaying,
                     ),
-                    // ── PLAY / PAUZA ────────────────────────────
                     _iconBtn(
                       icon: _isPlaying ? Icons.pause : Icons.play_arrow,
                       onPressed: _audioReady ? _togglePlayback : null,
