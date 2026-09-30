@@ -63,7 +63,7 @@ class AudioSingleton {
     _initializing = true;
     try {
       final seq = await RushSequencer.fromAsset(
-        'assets/soundfonts/FluidR3_GM.sf2',
+        'assets/soundfonts/GeneralUser-GS.sf2',
       );
       _instance = seq;
       _allInstances.add(seq);
@@ -80,7 +80,7 @@ class AudioSingleton {
   static Future<RushSequencer> recreate() async {
     _isPlaying = false;
     final seq = await RushSequencer.fromAsset(
-      'assets/soundfonts/FluidR3_GM.sf2',
+      'assets/soundfonts/GeneralUser-GS.sf2',
     );
     _instance = seq;
     _allInstances.add(seq);
