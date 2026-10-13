@@ -64,31 +64,3 @@ lib/*.broken_final
 _backup/
 _scripts/
 *.apk
-
-# Backupy lokalne
-lib/*.bak*
-lib/*.broken_final
-_backup/
-_scripts/
-*.apk
-
-# Backupy lokalne
-lib/*.bak*
-lib/*.broken_final
-_backup/
-_scripts/
-*.apk
-
-# Backupy lokalne
-lib/*.bak*
-lib/*.broken_final
-_backup/
-_scripts/
-*.apk
-
-# Backupy lokalne
-lib/*.bak*
-lib/*.broken_final
-_backup/
-_scripts/
-*.apk
