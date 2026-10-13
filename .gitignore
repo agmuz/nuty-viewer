@@ -57,3 +57,10 @@ android/key.properties
 # SoundFont - za duże na GitHub (148 MB)
 assets/soundfonts/*.sf2
 assets/soundfonts/*.sf3
+
+# Backupy lokalne
+lib/*.bak*
+lib/*.broken_final
+_backup/
+_scripts/
+*.apk
