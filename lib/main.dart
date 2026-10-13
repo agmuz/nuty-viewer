@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'verovio_screen.dart';
@@ -10,6 +10,16 @@ import 'package:saf/saf.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setEnabledSystemUIMode(
+    SystemUiMode.manual,
+    overlays: SystemUiOverlay.values,
+  );
+  SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
+    statusBarColor: Color(0xFF132845),
+    statusBarIconBrightness: Brightness.light,
+    systemNavigationBarColor: Colors.black,
+    systemNavigationBarIconBrightness: Brightness.light,
+  ));
   runApp(const MyApp());
 }
 
@@ -68,6 +78,7 @@ class _FileListScreenState extends State<FileListScreen>
   final TextEditingController _searchController = TextEditingController();
 
   bool _buildMode = false;
+  bool _editMode = false;
   Playlist? _editingPlaylist;
   List<String> _selectedFileNames = [];
   final TextEditingController _playlistNameController = TextEditingController();
@@ -402,11 +413,21 @@ class _FileListScreenState extends State<FileListScreen>
   }
 
   void _startNewPlaylist() {
+    final used = _playlists.map((p) => p.name).toSet();
+    var n = 1;
+    while (used.contains('list$n')) {
+      n++;
+    }
+    final pl = Playlist(
+      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      name: 'list$n',
+      fileNames: [],
+    );
     setState(() {
+      _playlists.add(pl);
       _buildMode = true;
-      _editingPlaylist = null;
+      _editingPlaylist = pl;
       _selectedFileNames = [];
-      _playlistNameController.text = '';
       _activePlaylistId = null;
       _applyFilter();
     });
@@ -435,73 +456,86 @@ class _FileListScreenState extends State<FileListScreen>
   }
 
   Future<void> _saveBuildPlaylist() async {
-    final name = _playlistNameController.text.trim();
-    if (name.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Podaj nazwę playlisty')),
-      );
-      return;
-    }
-    if (_selectedFileNames.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Wybierz co najmniej jeden utwór')),
-      );
-      return;
-    }
-
+    if (_editingPlaylist == null) return;
+    final savedId = _editingPlaylist!.id;
+    final savedName = _editingPlaylist!.name;
     setState(() {
-      if (_editingPlaylist != null) {
-        final idx = _playlists.indexWhere((p) => p.id == _editingPlaylist!.id);
-        if (idx >= 0) {
-          _playlists[idx] = Playlist(
-            id: _editingPlaylist!.id,
-            name: name,
-            fileNames: List.from(_selectedFileNames),
-          );
-        }
-      } else {
-        _playlists.add(Playlist(
-          id: DateTime.now().millisecondsSinceEpoch.toString(),
-          name: name,
+      final idx = _playlists.indexWhere((p) => p.id == savedId);
+      if (idx >= 0) {
+        _playlists[idx] = Playlist(
+          id: savedId,
+          name: savedName,
           fileNames: List.from(_selectedFileNames),
-        ));
+        );
+      }
+      _buildMode = false;
+      _editingPlaylist = null;
+      _selectedFileNames = [];
+      _activePlaylistId = savedId;
+      _applyFilter();
+    });
+    await _savePlaylists();
+  }
+
+  Future<void> _removeFromPlaylist(File file) async {
+    final name = file.path.split('/').last;
+    final plId = _activePlaylistId;
+    if (plId == null) return;
+    setState(() {
+      final idx = _playlists.indexWhere((p) => p.id == plId);
+      if (idx >= 0) {
+        final pl = _playlists[idx];
+        _playlists[idx] = Playlist(
+          id: pl.id,
+          name: pl.name,
+          fileNames: pl.fileNames.where((n) => n != name).toList(),
+        );
       }
     });
     await _savePlaylists();
-
-    if (!mounted) return;
-    setState(() {
-      _buildMode = false;
-      _editingPlaylist = null;
-      _selectedFileNames = [];
-      _playlistNameController.text = '';
-      _applyFilter();
-    });
+    if (mounted) _applyFilter();
   }
 
-  void _cancelBuild() {
+  /// Przenosi kafelek w playliście z pozycji [from] na [to].
+  Future<void> _moveInPlaylist(int from, int to) async {
+    final plId = _activePlaylistId;
+    if (plId == null) return;
     setState(() {
-      _buildMode = false;
-      _editingPlaylist = null;
-      _selectedFileNames = [];
-      _playlistNameController.text = '';
+      final idx = _playlists.indexWhere((p) => p.id == plId);
+      if (idx < 0) return;
+      final pl = _playlists[idx];
+      final list = List<String>.from(pl.fileNames);
+      if (from < 0 || from >= list.length) return;
+      if (to < 0 || to > list.length) return;
+      final item = list.removeAt(from);
+      list.insert(to > from ? to - 1 : to, item);
+      _playlists[idx] = Playlist(
+        id: pl.id,
+        name: pl.name,
+        fileNames: list,
+      );
+    });
+    await _savePlaylists();
+    if (mounted) _applyFilter();
+  }
+
+  void _closePlaylist() {
+    setState(() {
+      _activePlaylistId = null;
+      _editMode = false;
+      _applyFilter();
     });
   }
 
   void _openPlaylist(Playlist pl) {
     setState(() {
       _activePlaylistId = pl.id;
+      _editMode = false;
       _searchController.clear();
       _applyFilter();
     });
   }
 
-  void _closePlaylist() {
-    setState(() {
-      _activePlaylistId = null;
-      _applyFilter();
-    });
-  }
 
   Future<void> _showPlaylistMenu(Playlist pl) async {
     final action = await showModalBottomSheet<String>(
@@ -535,6 +569,16 @@ class _FileListScreenState extends State<FileListScreen>
                 onTap: () => Navigator.pop(ctx, 'edit'),
               ),
               ListTile(
+                leading: const Icon(Icons.drive_file_rename_outline),
+                title: const Text('Zmień nazwę'),
+                onTap: () => Navigator.pop(ctx, 'rename'),
+              ),
+              ListTile(
+                leading: const Icon(Icons.swap_vert),
+                title: const Text('Zmień kolejność plików'),
+                onTap: () => Navigator.pop(ctx, 'reorder'),
+              ),
+              ListTile(
                 leading: const Icon(Icons.cleaning_services),
                 title: const Text('Wyczyść oznaczenia'),
                 onTap: () => Navigator.pop(ctx, 'clear'),
@@ -558,11 +602,63 @@ class _FileListScreenState extends State<FileListScreen>
       _openPlaylist(pl);
     } else if (action == 'edit') {
       _startEditPlaylist(pl);
+    } else if (action == 'rename') {
+      await _renamePlaylist(pl);
+    } else if (action == 'reorder') {
+      setState(() {
+        _activePlaylistId = pl.id;
+        _editMode = true;
+        _searchController.clear();
+        _applyFilter();
+      });
     } else if (action == 'clear') {
       await _clearPlayed(pl.id);
     } else if (action == 'delete') {
       await _deletePlaylist(pl);
     }
+  }
+
+  Future<void> _renamePlaylist(Playlist pl) async {
+    final ctrl = TextEditingController(text: pl.name);
+    final newName = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Zmień nazwę playlisty'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(hintText: 'Nowa nazwa'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Anuluj'),
+          ),
+          TextButton(
+            onPressed: () {
+              final n = ctrl.text.trim();
+              if (n.isEmpty) return;
+              Navigator.pop(ctx, n);
+            },
+            child: const Text('Zmień'),
+          ),
+        ],
+      ),
+    );
+    if (newName == null || newName.isEmpty) return;
+    if (newName == pl.name) return;
+    setState(() {
+      final idx = _playlists.indexWhere((p) => p.id == pl.id);
+      if (idx >= 0) {
+        _playlists[idx] = Playlist(
+          id: pl.id,
+          name: newName,
+          fileNames: List.from(pl.fileNames),
+        );
+      }
+    });
+    await _savePlaylists();
+    if (mounted) _applyFilter();
   }
 
   Future<void> _clearPlayed(String key) async {
@@ -662,7 +758,7 @@ class _FileListScreenState extends State<FileListScreen>
                 ? Column(
                     children: [
                       _buildTopBar(activePlaylist),
-                      _buildBankBar(),
+                      if (_activePlaylistId == null) _buildBankBar(),
                       Expanded(
                         child: Center(
                           child: Column(
@@ -721,7 +817,7 @@ class _FileListScreenState extends State<FileListScreen>
                 : Column(
                     children: [
                       _buildTopBar(activePlaylist),
-                      _buildBankBar(),
+                      if (_activePlaylistId == null) _buildBankBar(),
                       if (_searchOpen)
                         Padding(
                           padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
@@ -774,21 +870,37 @@ class _FileListScreenState extends State<FileListScreen>
                                   buildMode: _buildMode,
                                   orderNumber: _selectionOrder(fileName),
                                   played: _isPlayed(fileName),
+                                  editMode: _editMode,
+                                  index: index,
+                                  position: _editMode ? index + 1 : null,
+                                  tileW: tileW,
+                                  tileH: tileH,
+                                  onMove: _moveInPlaylist,
                                   onTap: () {
                                     if (_buildMode) {
                                       _toggleSelection(file);
+                                    } else if (_editMode) {
+                                      // w edycji: nic (drag obok)
                                     } else {
                                       _openFile(file, index: index);
                                     }
                                   },
-                                  onLongPress: () => _deleteFile(file),
+                                  onLongPress: () {
+                                    if (_editMode) {
+                                      _removeFromPlaylist(file);
+                                    } else if (_activePlaylistId != null) {
+                                      // dlugie w playliście — nic
+                                    } else {
+                                      _deleteFile(file);
+                                    }
+                                  },
                                 );
                               },
                             );
                           },
                         ),
                       ),
-                      if (_buildMode) _buildBuildBar(),
+                      
                     ],
                   ),
       ),
@@ -1107,9 +1219,10 @@ class _FileListScreenState extends State<FileListScreen>
 
     final folderName = dir.name.trim();
     final isDefaultName = RegExp(r'^bank\d+$').hasMatch(bank);
+    final hadUriBefore = _bankUris[bank] != null;   // już miał folder?
     final shouldRename = folderName.isNotEmpty &&
-        isDefaultName &&
-        folderName != bank;
+        folderName != bank &&
+        (isDefaultName || hadUriBefore);   // domyślna LUB zmiana folderu
 
     var effectiveBank = bank;
 
@@ -1290,18 +1403,17 @@ class _FileListScreenState extends State<FileListScreen>
         scrollDirection: Axis.horizontal,
         itemCount: _banks.length + 1,
         itemBuilder: (context, index) {
-          // Ostatni element — przycisk "Nowy bank"
-          if (index == _banks.length) {
+          // Pierwszy element — przycisk "+ bank"
+          if (index == 0) {
             return Padding(
               padding: const EdgeInsets.only(right: 6),
               child: ActionChip(
-                avatar: const Icon(Icons.add, size: 16),
-                label: const Text('Nowy'),
+                label: const Text('+ bank'),
                 onPressed: _askForNewBank,
               ),
             );
           }
-          final bank = _banks[index];
+          final bank = _banks[index - 1];
           final active = bank == _activeBank;
           return Padding(
             key: ValueKey('bank_$bank'),
@@ -1328,48 +1440,85 @@ class _FileListScreenState extends State<FileListScreen>
       color: const Color(0xFF132845),
       child: Row(
         children: [
-          // LEWA STRONA: playlisty (chipy) albo nazwa aktywnej playlisty
-          if (_activePlaylistId == null && _playlists.isNotEmpty)
+          // LEWA STRONA: chip "+" + chipy playlist
+          if (_activePlaylistId == null)
             Expanded(
-              child: ListView.builder(
+              child: ListView(
                 scrollDirection: Axis.horizontal,
-                itemCount: _playlists.length,
-                itemBuilder: (context, index) {
-                  final pl = _playlists[index];
-                  return Padding(
-                    padding: const EdgeInsets.only(right: 6),
-                    child: GestureDetector(
-                      onLongPress: () => _showPlaylistMenu(pl),
+                children: [
+                  if (!_buildMode)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
                       child: ActionChip(
-                        avatar: const Icon(Icons.queue_music, size: 16),
-                        label: Text('${pl.name} (${pl.fileNames.length})'),
-                        onPressed: () => _openPlaylist(pl),
+                        label: const Text('+ lista'),
+                        onPressed: _startNewPlaylist,
                       ),
                     ),
-                  );
-                },
-              ),
-            )
-          else if (_activePlaylistId != null)
-            Expanded(
-              child: Text(
-                activePlaylist?.name ?? '',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
-                overflow: TextOverflow.ellipsis,
+                  if (_buildMode && _editingPlaylist != null)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: ActionChip(
+                        avatar: const Icon(Icons.check, size: 16),
+                        label: Text(
+                            '${_editingPlaylist!.name} (${_selectedFileNames.length})'),
+                        backgroundColor: const Color(0xFFD6AD23),
+                        onPressed: _saveBuildPlaylist,
+                      ),
+                    ),
+                  for (final pl in _playlists)
+                    if (!(_buildMode && _editingPlaylist?.id == pl.id))
+                      Padding(
+                        padding: const EdgeInsets.only(right: 6),
+                        child: GestureDetector(
+                          onLongPress: () => _showPlaylistMenu(pl),
+                          child: ChoiceChip(
+                            avatar: pl.id == _activePlaylistId
+                                ? const Icon(Icons.check, size: 16)
+                                : const Icon(Icons.queue_music, size: 16),
+                            label:
+                                Text('${pl.name} (${pl.fileNames.length})'),
+                            selected: pl.id == _activePlaylistId,
+                            onSelected: (_) {
+                              if (pl.id == _activePlaylistId) {
+                                setState(() {
+                                  _editMode = !_editMode;
+                                  _applyFilter();
+                                });
+                              } else {
+                                _openPlaylist(pl);
+                              }
+                            },
+                          ),
+                        ),
+                      ),
+                ],
               ),
             )
           else
-            const Expanded(
-              child: Text(
-                'Nuty',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
+            Expanded(
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: GestureDetector(
+                  onTap: () {
+                    if (_editMode) {
+                      setState(() => _editMode = false);
+                      _applyFilter();
+                    } else {
+                      _closePlaylist();
+                    }
+                  },
+                  onLongPress: () {
+                    if (activePlaylist != null) {
+                      _showPlaylistMenu(activePlaylist);
+                    }
+                  },
+                  child: ChoiceChip(
+                    key: const ValueKey('chip_active_playlist'),
+                    label: Text(
+                      '${activePlaylist?.name ?? ""} (${activePlaylist?.fileNames.length ?? 0})',
+                    ),
+                    selected: true,
+                  ),
                 ),
               ),
             ),
@@ -1396,29 +1545,6 @@ class _FileListScreenState extends State<FileListScreen>
             onPressed: () => setState(() => _searchOpen = !_searchOpen),
           ),
 
-          // nowa playlista (tylko na ekranie głównym)
-          if (!_buildMode && _activePlaylistId == null)
-            IconButton(
-              icon: const Icon(Icons.add, color: Colors.white, size: 22),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-              tooltip: 'Nowa playlista',
-              onPressed: _startNewPlaylist,
-            ),
-
-          // edycja playlisty (tylko w widoku playlisty)
-          if (_activePlaylistId != null && !_buildMode)
-            IconButton(
-              icon: const Icon(Icons.edit, color: Colors.white, size: 22),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
-              tooltip: 'Edytuj playlistę',
-              onPressed: () {
-                final pl =
-                    _playlists.firstWhere((p) => p.id == _activePlaylistId);
-                _startEditPlaylist(pl);
-              },
-            ),
 
           // czyść oznaczenia
           if (_hasPlayedInCurrent && !_buildMode)
@@ -1429,14 +1555,6 @@ class _FileListScreenState extends State<FileListScreen>
               constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
               tooltip: 'Czyść listę',
               onPressed: _clearCurrentPlayed,
-            ),
-          if (_activePlaylistId != null)
-            IconButton(
-              icon: const Icon(Icons.arrow_back, color: Colors.white, size: 44),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(minWidth: 72, minHeight: 72),
-              tooltip: 'Wróć do listy plików',
-              onPressed: _closePlaylist,
             ),
           if (_activePlaylistId == null)
             IconButton(
@@ -1451,47 +1569,6 @@ class _FileListScreenState extends State<FileListScreen>
     );
   }
 
-  Widget _buildBuildBar() {
-    return Container(
-      padding: const EdgeInsets.all(8),
-      color: Colors.black87,
-      child: SafeArea(
-        top: false,
-        child: Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: _playlistNameController,
-                style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(
-                  hintText: 'Nazwa playlisty',
-                  hintStyle: TextStyle(color: Colors.white54),
-                  enabledBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.white54),
-                  ),
-                  focusedBorder: OutlineInputBorder(
-                    borderSide: BorderSide(color: Colors.white),
-                  ),
-                  isDense: true,
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              icon: const Icon(Icons.close, color: Colors.white),
-              onPressed: _cancelBuild,
-              tooltip: 'Anuluj',
-            ),
-            IconButton(
-              icon: const Icon(Icons.save, color: Colors.green),
-              onPressed: _saveBuildPlaylist,
-              tooltip: 'Zapisz',
-            ),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 class _Tile extends StatelessWidget {
@@ -1501,6 +1578,12 @@ class _Tile extends StatelessWidget {
   final bool buildMode;
   final int? orderNumber;
   final bool played;
+  final bool editMode;
+  final int index;
+  final int? position;
+  final double tileW;
+  final double tileH;
+  final void Function(int from, int to)? onMove;
 
   const _Tile({
     required this.fileName,
@@ -1509,6 +1592,12 @@ class _Tile extends StatelessWidget {
     this.buildMode = false,
     this.orderNumber,
     this.played = false,
+    this.editMode = false,
+    this.index = 0,
+    this.position,
+    this.tileW = 100,
+    this.tileH = 80,
+    this.onMove,
   });
 
   @override
@@ -1542,18 +1631,36 @@ class _Tile extends StatelessWidget {
       bgColor = const Color(0xFF7BA7D9);
     }
 
-    return Material(
+    final inner = Material(
       color: bgColor,
       borderRadius: BorderRadius.circular(6),
       child: InkWell(
         onTap: onTap,
-        onLongPress: onLongPress,
+        onLongPress: editMode ? null : onLongPress,
         borderRadius: BorderRadius.circular(6),
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
           child: Row(
             children: [
-              if (buildMode && selected)
+              if (editMode && position != null)
+                Container(
+                  width: 40,
+                  height: 40,
+                  alignment: Alignment.center,
+                  decoration: const BoxDecoration(
+                    color: Colors.black87,
+                    shape: BoxShape.circle,
+                  ),
+                  child: Text(
+                    '$position',
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
+                  ),
+                )
+              else if (buildMode && selected)
                 Container(
                   width: 40,
                   height: 40,
@@ -1606,6 +1713,37 @@ class _Tile extends StatelessWidget {
           ),
         ),
       ),
+    );
+
+    if (!editMode || onMove == null) return inner;
+
+    return DragTarget<int>(
+      onWillAcceptWithDetails: (d) => d.data != index,
+      onAcceptWithDetails: (d) => onMove!(d.data, index),
+      builder: (context, candidate, rejected) {
+        final highlight = candidate.isNotEmpty;
+        return LongPressDraggable<int>(
+          data: index,
+          feedback: SizedBox(
+            width: tileW,
+            height: tileH,
+            child: Material(
+              color: Colors.transparent,
+              child: Opacity(opacity: 0.7, child: inner),
+            ),
+          ),
+          childWhenDragging: Opacity(opacity: 0.3, child: inner),
+          child: highlight
+              ? DecoratedBox(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.white, width: 3),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: inner,
+                )
+              : inner,
+        );
+      },
     );
   }
 }
