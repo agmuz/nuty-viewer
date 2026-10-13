@@ -10,10 +10,7 @@ import 'package:saf/saf.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  SystemChrome.setEnabledSystemUIMode(
-    SystemUiMode.manual,
-    overlays: SystemUiOverlay.values,
-  );
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Color(0xFF132845),
     statusBarIconBrightness: Brightness.light,
@@ -87,6 +84,7 @@ class _FileListScreenState extends State<FileListScreen>
   Map<String, List<String>> _playedByPlaylist = {};
 
   bool _searchOpen = false;
+  bool _barsVisible = true;
 
   static const _playedAllKey = 'all';
 
@@ -346,6 +344,9 @@ class _FileListScreenState extends State<FileListScreen>
         ),
       ),
     );
+
+    // Po powrocie z verovio_screen - przywroc fullscreen
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
 
     if (mounted) setState(() {});
   }
@@ -742,7 +743,7 @@ class _FileListScreenState extends State<FileListScreen>
   }
 
   @override
-  Widget build(BuildContext context) {
+    Widget build(BuildContext context) {
     final activePlaylist = _activePlaylistId != null
         ? _playlists.firstWhere(
             (p) => p.id == _activePlaylistId,
@@ -806,7 +807,7 @@ class _FileListScreenState extends State<FileListScreen>
                                   onPressed: () =>
                                       _refreshFromBankUri(_activeBank),
                                   icon: const Icon(Icons.refresh),
-                                  label: const Text('Odśwież z Dysku Google'),
+                                  label: const Text('Odśwież z Dysk Google'),
                                 ),
                             ],
                           ),
@@ -814,93 +815,131 @@ class _FileListScreenState extends State<FileListScreen>
                       ),
                     ],
                   )
-                : Column(
+                : Stack(
                     children: [
-                      _buildTopBar(activePlaylist),
-                      if (_activePlaylistId == null) _buildBankBar(),
-                      if (_searchOpen)
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
-                          child: TextField(
-                            controller: _searchController,
-                            autofocus: true,
-                            decoration: InputDecoration(
-                              hintText: 'Szukaj po tytule lub numerze...',
-                              prefixIcon: const Icon(Icons.search, size: 20),
-                              suffixIcon: IconButton(
-                                icon: const Icon(Icons.close, size: 20),
-                                onPressed: () {
-                                  _searchController.clear();
-                                  setState(() => _searchOpen = false);
+                      Positioned.fill(
+                        child: NotificationListener<ScrollNotification>(
+                          onNotification: (n) {
+                            if (n is ScrollUpdateNotification) {
+                              final offset = n.metrics.pixels;
+                              if (offset > 0 && _barsVisible) {
+                                setState(() => _barsVisible = false);
+                              } else if (offset == 0 && !_barsVisible) {
+                                setState(() => _barsVisible = true);
+                              }
+                            }
+                            return false;
+                          },
+                          child: LayoutBuilder(
+                            builder: (context, constraints) {
+                              const cols = 4;
+                              const minRowsVisible = 8;
+
+                              final tileW = constraints.maxWidth / cols;
+                              final tileH =
+                                  constraints.maxHeight / minRowsVisible;
+                              final aspect = tileW / tileH;
+
+                              final barsHeight = _activePlaylistId == null
+                                  ? 100.0
+                                  : 56.0;
+
+                              return GridView.builder(
+                                padding: EdgeInsets.only(
+                                  left: 6,
+                                  right: 6,
+                                  bottom: 6,
+                                  top: _barsVisible ? barsHeight + 6 : 6,
+                                ),
+                                gridDelegate:
+                                    SliverGridDelegateWithFixedCrossAxisCount(
+                                  crossAxisCount: cols,
+                                  crossAxisSpacing: 6,
+                                  mainAxisSpacing: 6,
+                                  childAspectRatio: aspect,
+                                ),
+                                itemCount: _filteredFiles.length,
+                                itemBuilder: (context, index) {
+                                  final file = _filteredFiles[index];
+                                  final fileName = file.path.split('/').last;
+                                  return _Tile(
+                                    fileName: fileName,
+                                    buildMode: _buildMode,
+                                    orderNumber: _selectionOrder(fileName),
+                                    played: _isPlayed(fileName),
+                                    editMode: _editMode,
+                                    index: index,
+                                    position: _editMode ? index + 1 : null,
+                                    tileW: tileW,
+                                    tileH: tileH,
+                                    onMove: _moveInPlaylist,
+                                    onTap: () {
+                                      if (_buildMode) {
+                                        _toggleSelection(file);
+                                      } else if (_editMode) {
+                                        // w edycji: nic (drag obok)
+                                      } else {
+                                        _openFile(file, index: index);
+                                      }
+                                    },
+                                    onLongPress: () {
+                                      if (_editMode) {
+                                        _removeFromPlaylist(file);
+                                      } else if (_activePlaylistId != null) {
+                                        // dlugie w playliście — nic
+                                      } else {
+                                        _deleteFile(file);
+                                      }
+                                    },
+                                  );
                                 },
-                              ),
-                              border: const OutlineInputBorder(),
-                              isDense: true,
-                              contentPadding: const EdgeInsets.symmetric(
-                                  horizontal: 8, vertical: 8),
-                            ),
+                              );
+                            },
                           ),
                         ),
-                      Expanded(
-                        child: LayoutBuilder(
-                          builder: (context, constraints) {
-                            const cols = 4;
-                            const minRowsVisible = 8;
-
-                            final tileW = constraints.maxWidth / cols;
-                            final tileH =
-                                constraints.maxHeight / minRowsVisible;
-                            final aspect = tileW / tileH;
-
-                            return GridView.builder(
-                              padding: const EdgeInsets.all(6),
-                              gridDelegate:
-                                  SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: cols,
-                                crossAxisSpacing: 6,
-                                mainAxisSpacing: 6,
-                                childAspectRatio: aspect,
+                      ),
+                      AnimatedPositioned(
+                        duration: const Duration(milliseconds: 200),
+                        curve: Curves.easeOut,
+                        top: _barsVisible
+                            ? 0
+                            : -(_activePlaylistId == null ? 100.0 : 56.0),
+                        left: 0,
+                        right: 0,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            _buildTopBar(activePlaylist),
+                            if (_activePlaylistId == null) _buildBankBar(),
+                            if (_searchOpen)
+                              Container(
+                                color: const Color(0xFF132845),
+                                padding:
+                                    const EdgeInsets.fromLTRB(8, 4, 8, 4),
+                                child: TextField(
+                                  controller: _searchController,
+                                  autofocus: true,
+                                  decoration: InputDecoration(
+                                    hintText: 'Szukaj po tytule lub numerze...',
+                                    prefixIcon:
+                                        const Icon(Icons.search, size: 20),
+                                    suffixIcon: IconButton(
+                                      icon: const Icon(Icons.close, size: 20),
+                                      onPressed: () {
+                                        _searchController.clear();
+                                        setState(() => _searchOpen = false);
+                                      },
+                                    ),
+                                    border: const OutlineInputBorder(),
+                                    isDense: true,
+                                    contentPadding: const EdgeInsets.symmetric(
+                                        horizontal: 8, vertical: 8),
+                                  ),
+                                ),
                               ),
-                              itemCount: _filteredFiles.length,
-                              itemBuilder: (context, index) {
-                                final file = _filteredFiles[index];
-                                final fileName = file.path.split('/').last;
-                                return _Tile(
-                                  fileName: fileName,
-                                  buildMode: _buildMode,
-                                  orderNumber: _selectionOrder(fileName),
-                                  played: _isPlayed(fileName),
-                                  editMode: _editMode,
-                                  index: index,
-                                  position: _editMode ? index + 1 : null,
-                                  tileW: tileW,
-                                  tileH: tileH,
-                                  onMove: _moveInPlaylist,
-                                  onTap: () {
-                                    if (_buildMode) {
-                                      _toggleSelection(file);
-                                    } else if (_editMode) {
-                                      // w edycji: nic (drag obok)
-                                    } else {
-                                      _openFile(file, index: index);
-                                    }
-                                  },
-                                  onLongPress: () {
-                                    if (_editMode) {
-                                      _removeFromPlaylist(file);
-                                    } else if (_activePlaylistId != null) {
-                                      // dlugie w playliście — nic
-                                    } else {
-                                      _deleteFile(file);
-                                    }
-                                  },
-                                );
-                              },
-                            );
-                          },
+                          ],
                         ),
                       ),
-                      
                     ],
                   ),
       ),
